@@ -1,7 +1,8 @@
 use claude_codex_gemini_router::adc_auth::ADCAuthManager;
 use claude_codex_gemini_router::server::{RouterResponse, RouterServer};
 use claude_codex_gemini_router::translator::{
-    anthropic_to_gemini_request, gemini_to_anthropic_response, gemini_to_openai_chat_response,
+    anthropic_to_gemini_request, format_model_display_name, format_model_short_badge,
+    format_model_short_label, gemini_to_anthropic_response, gemini_to_openai_chat_response,
     gemini_to_openai_responses, openai_chat_to_gemini_request, openai_responses_to_gemini_request,
     resolve_gemini_model, sanitize_json_schema, AnthropicStreamState,
     SKIP_THOUGHT_SIGNATURE_VALIDATOR, SIGNATURE_STORE,
@@ -1469,4 +1470,84 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
     std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
     let _ = std::fs::remove_file(&tmp_adc);
 }
+
+#[tokio::test]
+async fn test_dynamic_models_aliases_and_runtime_config() {
+    let _async_guard = ASYNC_ENV_LOCK.lock().await;
+    {
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "GEMINI_MODEL_ALIASES",
+            "nextgen=gemini-5.0-ultra,fast-next=gemini-5.0-flash",
+        );
+        assert_eq!(resolve_gemini_model(Some("nextgen")), "gemini-5.0-ultra");
+        assert_eq!(
+            resolve_gemini_model(Some("fast-next[1m]")),
+            "gemini-5.0-flash"
+        );
+        assert_eq!(
+            resolve_gemini_model(Some("gemini-2.5-pro[1m]")),
+            "gemini-2.5-pro"
+        );
+        std::env::remove_var("GEMINI_MODEL_ALIASES");
+
+        assert_eq!(
+            format_model_display_name("gemini-3.8-flash"),
+            "Gemini 3.8 Flash"
+        );
+        assert_eq!(format_model_short_badge("gemini-3.8-flash"), "G3.8");
+        assert_eq!(
+            format_model_display_name("gemini-4-argon"),
+            "Gemini 4.0 Argon"
+        );
+        assert_eq!(format_model_short_badge("gemini-4-argon"), "G4");
+        assert_eq!(
+            format_model_display_name("gemini-2.5-pro"),
+            "Gemini 2.5 Pro"
+        );
+        assert_eq!(format_model_short_label("gemini-2.5-pro"), "Gemini 2.5 Pro");
+        assert_eq!(format_model_short_badge("gemini-2.5-pro"), "G2.5P");
+    }
+
+    let server = RouterServer::new(Some("test-proj".to_string()), Some("global".to_string()));
+    let cfg_body = serde_json::to_vec(&json!({
+        "primary_model": "gemini-2.5-pro",
+        "fast_model": "gemini-2.5-flash",
+        "fallback_model": "gemini-2.5-flash",
+        "available_models": ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
+        "reasoning_effort": "high",
+        "hot_swap": true
+    }))
+    .unwrap();
+
+    match server.handle_request("POST", "/config", &cfg_body).await {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["primary_model"], "gemini-2.5-pro");
+            assert_eq!(data["fast_model"], "gemini-2.5-flash");
+            assert_eq!(data["fallback_model"], "gemini-2.5-flash");
+            assert!(data["available_models"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("gemini-2.5-pro")));
+        }
+        _ => panic!("Expected 200 JSON from POST /config"),
+    }
+
+    match server.handle_request("GET", "/v1/models", &[]).await {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            let ids: Vec<&str> = data["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str())
+                .collect();
+            assert!(ids.contains(&"gemini-2.5-pro"));
+            assert!(ids.contains(&"gemini-2.5-flash"));
+        }
+        _ => panic!("Expected 200 JSON from GET /v1/models"),
+    }
+}
+
 

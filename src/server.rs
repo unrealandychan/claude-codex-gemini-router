@@ -1,6 +1,7 @@
 use crate::adc_auth::ADCAuthManager;
 use crate::translator::{
-    anthropic_to_gemini_request, extract_candidate_parts, format_sse, gemini_to_anthropic_response,
+    anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
+    extract_candidate_parts, format_model_display_name, format_sse, gemini_to_anthropic_response,
     gemini_to_openai_chat_response, gemini_to_openai_responses, openai_chat_to_gemini_request,
     openai_responses_to_gemini_request, resolve_gemini_model, AnthropicStreamState,
     DEFAULT_GEMINI_MODEL, SIGNATURE_STORE,
@@ -15,6 +16,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub const DEFAULT_AVAILABLE_MODELS: &[&str] = &[
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+];
+
 fn short_id(len: usize) -> String {
     Uuid::new_v4().simple().to_string().chars().take(len).collect()
 }
@@ -25,6 +36,24 @@ pub fn fallback_model_for(model: &str) -> Option<&'static str> {
         "gemini-3.8-flash" => Some("gemini-3-flash-preview"),
         _ => None,
     }
+}
+
+fn parse_available_models_env() -> Vec<String> {
+    if let Ok(raw) = std::env::var("GEMINI_AVAILABLE_MODELS") {
+        let parsed: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_gemini_model(Some(s)))
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_AVAILABLE_MODELS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub struct RouterMetrics {
@@ -46,6 +75,9 @@ struct MetricsInner {
     fallback_count: u64,
     active_model: String,
     default_model_override: Option<String>,
+    fast_model_override: Option<String>,
+    fallback_model: Option<String>,
+    available_models: Vec<String>,
     reasoning_effort: String,
     hot_swap_active: bool,
     last_client: Option<String>,
@@ -60,10 +92,23 @@ impl RouterMetrics {
         let env_model = std::env::var("ROUTER_DEFAULT_MODEL")
             .or_else(|_| std::env::var("GEMINI_PRIMARY_MODEL"))
             .ok()
-            .filter(|s| !s.trim().is_empty());
+            .filter(|s| !s.trim().is_empty())
+            .map(|m| resolve_gemini_model(Some(&m)));
         let active = env_model
             .clone()
-            .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+            .unwrap_or_else(default_gemini_model);
+        let fast_model = std::env::var("GEMINI_FAST_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|m| resolve_gemini_model(Some(&m)));
+        let fallback_model = std::env::var("GEMINI_FALLBACK_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|m| resolve_gemini_model(Some(&m)));
+        let mut available_models = parse_available_models_env();
+        if !available_models.contains(&active) {
+            available_models.insert(0, active.clone());
+        }
         let effort = std::env::var("GEMINI_REASONING_EFFORT")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -86,6 +131,9 @@ impl RouterMetrics {
                 fallback_count: 0,
                 active_model: active,
                 default_model_override: env_model,
+                fast_model_override: fast_model,
+                fallback_model,
+                available_models,
                 reasoning_effort: effort,
                 hot_swap_active: hot_swap,
                 last_client: None,
@@ -159,7 +207,81 @@ impl RouterMetrics {
         let mut g = self.inner.lock().unwrap();
         g.default_model_override = Some(resolved.clone());
         g.active_model = resolved.clone();
+        if !g.available_models.contains(&resolved) {
+            g.available_models.insert(0, resolved.clone());
+        }
         resolved
+    }
+
+    pub fn set_fast_model(&self, model: &str) -> String {
+        let resolved = resolve_gemini_model(Some(model));
+        let mut g = self.inner.lock().unwrap();
+        g.fast_model_override = Some(resolved.clone());
+        if !g.available_models.contains(&resolved) {
+            g.available_models.push(resolved.clone());
+        }
+        resolved
+    }
+
+    pub fn set_fallback_model(&self, model: Option<&str>) -> Option<String> {
+        let mut g = self.inner.lock().unwrap();
+        match model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some("none") | Some("off") => {
+                g.fallback_model = None;
+                None
+            }
+            Some(m) => {
+                let resolved = resolve_gemini_model(Some(m));
+                g.fallback_model = Some(resolved.clone());
+                Some(resolved)
+            }
+            None => {
+                g.fallback_model = None;
+                None
+            }
+        }
+    }
+
+    pub fn set_available_models(&self, models: Vec<String>) {
+        let mut cleaned: Vec<String> = Vec::new();
+        for m in models {
+            let trimmed = m.trim();
+            if !trimmed.is_empty() {
+                let resolved = resolve_gemini_model(Some(trimmed));
+                if !cleaned.contains(&resolved) {
+                    cleaned.push(resolved);
+                }
+            }
+        }
+        if !cleaned.is_empty() {
+            let mut g = self.inner.lock().unwrap();
+            let active = g.active_model.clone();
+            if !cleaned.contains(&active) {
+                cleaned.insert(0, active);
+            }
+            g.available_models = cleaned;
+        }
+    }
+
+    pub fn add_available_model(&self, model: &str) -> String {
+        let resolved = resolve_gemini_model(Some(model));
+        let mut g = self.inner.lock().unwrap();
+        if !g.available_models.contains(&resolved) {
+            g.available_models.push(resolved.clone());
+        }
+        resolved
+    }
+
+    pub fn get_available_models(&self) -> Vec<String> {
+        self.inner.lock().unwrap().available_models.clone()
+    }
+
+    pub fn get_fast_model_override(&self) -> Option<String> {
+        self.inner.lock().unwrap().fast_model_override.clone()
+    }
+
+    pub fn get_fallback_model(&self) -> Option<String> {
+        self.inner.lock().unwrap().fallback_model.clone()
     }
 
     pub fn set_reasoning_effort(&self, effort: &str) {
@@ -196,6 +318,9 @@ impl RouterMetrics {
             "tokens_out": g.tokens_out,
             "active_model": g.active_model,
             "default_model_override": g.default_model_override,
+            "fast_model_override": g.fast_model_override,
+            "fallback_model": g.fallback_model,
+            "available_models": g.available_models,
             "uptime_seconds": self.started_at.elapsed().as_secs(),
         })
     }
@@ -523,6 +648,13 @@ impl RouterServer {
                     || lower.contains("small")
                     || lower.contains("fast"));
 
+            if is_fast_tier {
+                if let Some(fast_override) = self.metrics.get_fast_model_override() {
+                    obj.insert("model".to_string(), Value::String(fast_override));
+                    return body;
+                }
+            }
+
             if let Some(target_model) = override_model {
                 if is_fast_tier {
                     obj.insert(
@@ -538,7 +670,7 @@ impl RouterServer {
                             | "gemini-4.0"
                             | "gemini-4.0-pro"
                             | "gemini-3.1-pro-preview"
-                    );
+                    ) || self.metrics.get_available_models().contains(&lower);
                     if lower.is_empty()
                         || !lower.starts_with("gemini-")
                         || hot_swap
@@ -564,6 +696,26 @@ impl RouterServer {
         body
     }
 
+    pub fn resolve_fallback_model(&self, model: &str) -> Option<String> {
+        if let Some(configured) = self.metrics.get_fallback_model() {
+            if !configured.is_empty() && configured != model {
+                return Some(configured);
+            }
+        }
+        if let Ok(env_fb) = std::env::var("GEMINI_FALLBACK_MODEL") {
+            let trimmed = env_fb.trim();
+            if !trimmed.is_empty() {
+                let resolved = resolve_gemini_model(Some(trimmed));
+                if resolved != model {
+                    return Some(resolved);
+                }
+            }
+        }
+        fallback_model_for(model)
+            .map(|s| s.to_string())
+            .filter(|fb| fb != model)
+    }
+
     pub async fn generate_with_fallback(
         &self,
         model: &str,
@@ -572,11 +724,11 @@ impl RouterServer {
         match self.upstream.generate_content(model, payload).await {
             Ok(resp) => Ok((model.to_string(), resp)),
             Err(err) => {
-                if let Some(fallback) = fallback_model_for(model) {
+                if let Some(fallback) = self.resolve_fallback_model(model) {
                     if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
                         self.metrics.inner.lock().unwrap().fallback_count += 1;
-                        match self.upstream.generate_content(fallback, payload).await {
-                            Ok(resp) => return Ok((fallback.to_string(), resp)),
+                        match self.upstream.generate_content(&fallback, payload).await {
+                            Ok(resp) => return Ok((fallback, resp)),
                             Err(fb_err) => {
                                 if fb_err.status_code == 401 || fb_err.status_code == 403 {
                                     self.auth
@@ -609,11 +761,11 @@ impl RouterServer {
         match self.upstream.stream_generate_content(model, payload).await {
             Ok(rx) => Ok((model.to_string(), rx)),
             Err(err) => {
-                if let Some(fallback) = fallback_model_for(model) {
+                if let Some(fallback) = self.resolve_fallback_model(model) {
                     if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
                         self.metrics.inner.lock().unwrap().fallback_count += 1;
-                        match self.upstream.stream_generate_content(fallback, payload).await {
-                            Ok(rx) => return Ok((fallback.to_string(), rx)),
+                        match self.upstream.stream_generate_content(&fallback, payload).await {
+                            Ok(rx) => return Ok((fallback, rx)),
                             Err(fb_err) => {
                                 if fb_err.status_code == 401 || fb_err.status_code == 403 {
                                     self.auth
@@ -670,12 +822,17 @@ impl RouterServer {
                 let default_model = self
                     .metrics
                     .get_default_model_override()
-                    .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
-                let primary_model = if default_model.contains("4") || default_model.contains("argon") {
-                    "gemini-4-argon".to_string()
-                } else {
-                    default_model.clone()
-                };
+                    .unwrap_or_else(default_gemini_model);
+                let primary_model = resolve_gemini_model(Some(&default_model));
+                let fast_model = self
+                    .metrics
+                    .get_fast_model_override()
+                    .unwrap_or_else(default_fast_gemini_model);
+                let fallback_model = self
+                    .resolve_fallback_model(&primary_model)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                let available_models = self.metrics.get_available_models();
                 if let Some(obj) = status.as_object_mut() {
                     obj.insert("status".to_string(), Value::String("ok".to_string()));
                     obj.insert("adc".to_string(), adc_status);
@@ -686,6 +843,12 @@ impl RouterServer {
                     obj.insert(
                         "primary_model".to_string(),
                         Value::String(primary_model),
+                    );
+                    obj.insert("fast_model".to_string(), Value::String(fast_model));
+                    obj.insert("fallback_model".to_string(), fallback_model);
+                    obj.insert(
+                        "available_models".to_string(),
+                        json!(available_models),
                     );
                     obj.insert(
                         "reasoning_effort".to_string(),
@@ -714,6 +877,18 @@ impl RouterServer {
                 if body.get("reset_stats").and_then(|v| v.as_bool()) == Some(true) {
                     self.metrics.reset();
                 }
+                if let Some(arr) = body.get("available_models").and_then(|v| v.as_array()) {
+                    let list: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    self.metrics.set_available_models(list);
+                }
+                if let Some(add_m) = body.get("add_model").and_then(|v| v.as_str()) {
+                    if !add_m.trim().is_empty() {
+                        self.metrics.add_available_model(add_m.trim());
+                    }
+                }
                 if let Some(m) = body
                     .get("default_model")
                     .or_else(|| body.get("primary_model"))
@@ -725,6 +900,15 @@ impl RouterServer {
                             self.metrics.set_hot_swap_active(true);
                         }
                     }
+                }
+                if let Some(fm) = body.get("fast_model").and_then(|v| v.as_str()) {
+                    if !fm.trim().is_empty() {
+                        self.metrics.set_fast_model(fm.trim());
+                    }
+                }
+                if body.get("fallback_model").is_some() {
+                    let fb = body.get("fallback_model").and_then(|v| v.as_str());
+                    self.metrics.set_fallback_model(fb);
                 }
                 if let Some(e) = body.get("reasoning_effort").and_then(|v| v.as_str()) {
                     if !e.trim().is_empty() {
@@ -745,13 +929,20 @@ impl RouterServer {
                 let def_model = self
                     .metrics
                     .get_default_model_override()
-                    .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+                    .unwrap_or_else(default_gemini_model);
+                let fast_model = self
+                    .metrics
+                    .get_fast_model_override()
+                    .unwrap_or_else(default_fast_gemini_model);
                 RouterResponse::Json(
                     200,
                     json!({
                         "status": "updated",
                         "default_model": def_model,
                         "primary_model": def_model,
+                        "fast_model": fast_model,
+                        "fallback_model": self.resolve_fallback_model(&def_model),
+                        "available_models": self.metrics.get_available_models(),
                         "reasoning_effort": self.metrics.get_reasoning_effort(),
                         "hot_swap_active": self.metrics.get_hot_swap_active(),
                         "active_model": self.metrics.get_active_model(),
@@ -765,26 +956,29 @@ impl RouterServer {
                     .metrics
                     .get_default_model_override()
                     .unwrap_or_else(|| self.metrics.get_active_model());
-                let mut models = vec![
-                    ("gemini-3.8-flash", "Gemini 3.8 Flash (Vertex AI ADC)"),
-                    ("gemini-4-argon", "Gemini 4.0 Argon (Vertex AI ADC)"),
-                    ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
-                    ("gemini-3-flash-preview", "Gemini 3.0 Flash Preview"),
-                    ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-                    ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-                    ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
-                ];
-                if let Some(pos) = models.iter().position(|(id, _)| *id == active_model) {
+                let mut models = self.metrics.get_available_models();
+                if !models.contains(&active_model) {
+                    models.insert(0, active_model.clone());
+                } else if let Some(pos) = models.iter().position(|id| *id == active_model) {
                     if pos > 0 {
                         let item = models.remove(pos);
                         models.insert(0, item);
                     }
                 }
-                let first_id = models.first().map(|(id, _)| *id).unwrap_or("gemini-3.8-flash");
-                let last_id = models.last().map(|(id, _)| *id).unwrap_or("gemini-2.5-flash-lite");
+                let first_id = models
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("gemini-3.8-flash")
+                    .to_string();
+                let last_id = models
+                    .last()
+                    .map(|s| s.as_str())
+                    .unwrap_or("gemini-2.5-flash-lite")
+                    .to_string();
                 let data: Vec<Value> = models
                     .iter()
-                    .map(|(m, display_name)| {
+                    .map(|m| {
+                        let display_name = format_model_display_name(m);
                         json!({
                             "id": m,
                             "object": "model",

@@ -22,6 +22,11 @@ BarWidget {
   property bool claudeInstalled: true
   property bool codexInstalled: true
   property string primaryModel: "gemini-3.8-flash"
+  property string primaryModelDisplay: "Gemini 3.8 Flash"
+  property var modelPresets: [
+    { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", short: "Gemini 3.8", badge: "G3.8" },
+    { id: "gemini-4-argon", label: "Gemini 4.0 Argon", short: "Gemini 4.0", badge: "G4" }
+  ]
   property string reasoningEffort: "medium"
   property bool hotSwapActive: false
   property string statusLabel: "Direct (Routing Off)"
@@ -118,6 +123,10 @@ BarWidget {
       if (data.claude_installed !== undefined) root.claudeInstalled = data.claude_installed === true
       if (data.codex_installed !== undefined) root.codexInstalled = data.codex_installed === true
       if (data.primary_model) root.primaryModel = data.primary_model
+      if (data.primary_model_display) root.primaryModelDisplay = data.primary_model_display
+      if (Array.isArray(data.model_presets) && data.model_presets.length > 0) {
+        root.modelPresets = data.model_presets
+      }
       if (data.reasoning_effort) root.reasoningEffort = data.reasoning_effort
       if (data.hot_swap_active !== undefined) root.hotSwapActive = data.hot_swap_active === true
       if (data.status_label) root.statusLabel = data.status_label
@@ -646,51 +655,113 @@ BarWidget {
               Layout.fillWidth: true
               spacing: Style.space(6)
               Text {
-                text: "Active Vertex AI Gemini Model"
+                text: "Active Vertex AI Gemini Model (" + root.primaryModel + ")"
                 font.bold: true
                 color: Color.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 Layout.fillWidth: true
+                elide: Text.ElideRight
               }
               Text {
-                text: "Haiku -> 3.8 · Hot-Swap Ready"
+                text: "Hot-Swap Ready"
                 color: root.hotSwapActive ? "#a6e3a1" : Color.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
             }
 
+            GridLayout {
+              Layout.fillWidth: true
+              columns: 2
+              columnSpacing: Style.space(8)
+              rowSpacing: Style.space(6)
+
+              Repeater {
+                model: root.modelPresets
+                delegate: Button {
+                  required property var modelData
+                  Layout.fillWidth: true
+                  Layout.preferredHeight: Style.space(28)
+                  text: modelData.label || modelData.id
+                  tooltipText: modelData.id || ""
+                  bordered: true
+                  accent: Color.accent
+                  selected: root.primaryModel === modelData.id
+                  enabled: !root.isBusy
+                  onClicked: root.runAction(
+                    ["set-model", "--model", modelData.id],
+                    "Switched model to " + modelData.id
+                  )
+                }
+              }
+            }
+
             RowLayout {
               Layout.fillWidth: true
-              spacing: Style.space(8)
+              spacing: Style.space(6)
 
-              Button {
+              Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(28)
-                text: "Gemini 3.8 Flash"
-                bordered: true
-                accent: Color.accent
-                selected: root.primaryModel === "gemini-3.8-flash"
-                enabled: !root.isBusy
-                onClicked: root.runAction(
-                  ["set-model", "--model", "gemini-3.8-flash"],
-                  "Switched model to gemini-3.8-flash"
-                )
+                Layout.preferredHeight: Style.space(26)
+                radius: Style.space(4)
+                color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.06)
+                border.width: 1
+                border.color: customModelInput.activeFocus
+                  ? Color.accent
+                  : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.16)
+
+                TextInput {
+                  id: customModelInput
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  verticalAlignment: TextInput.AlignVCenter
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  color: Color.foreground
+                  clip: true
+                  selectByMouse: true
+                  onAccepted: {
+                    var val = customModelInput.text.trim()
+                    if (val.length > 0 && !root.isBusy) {
+                      root.runAction(
+                        ["set-model", "--model", val],
+                        "Switched model to " + val
+                      )
+                      customModelInput.text = ""
+                    }
+                  }
+
+                  Text {
+                    anchors.fill: parent
+                    verticalAlignment: Text.AlignVCenter
+                    text: "Custom model ID (e.g. gemini-2.5-pro, gemini-3.1-pro-preview)…"
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    color: Color.muted
+                    visible: customModelInput.text.length === 0 && !customModelInput.activeFocus
+                    elide: Text.ElideRight
+                  }
+                }
               }
 
               Button {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Style.space(28)
-                text: "Gemini 4.0 Argon"
+                Layout.preferredHeight: Style.space(26)
+                text: "Use Model"
                 bordered: true
                 accent: Color.accent
-                selected: root.primaryModel === "gemini-4-argon"
-                enabled: !root.isBusy
-                onClicked: root.runAction(
-                  ["set-model", "--model", "gemini-4-argon"],
-                  "Switched model to gemini-4-argon"
-                )
+                enabled: !root.isBusy && customModelInput.text.trim().length > 0
+                onClicked: {
+                  var val = customModelInput.text.trim()
+                  if (val.length > 0) {
+                    root.runAction(
+                      ["set-model", "--model", val],
+                      "Switched model to " + val
+                    )
+                    customModelInput.text = ""
+                  }
+                }
               }
             }
 

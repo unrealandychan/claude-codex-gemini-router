@@ -191,6 +191,7 @@ fn main() {
     let id_toggle_codex = MenuId::new("toggle_codex");
     let id_model_flash = MenuId::new("model_flash");
     let id_model_argon = MenuId::new("model_argon");
+    let id_model_flip = MenuId::new("model_flip");
     let id_restart_router = MenuId::new("restart_router");
     let id_adc_login = MenuId::new("adc_login");
     let id_quit = MenuId::new("quit");
@@ -226,6 +227,12 @@ fn main() {
         true,
         None,
     );
+    let item_flip = MenuItem::with_id(
+        id_model_flip.clone(),
+        "Cycle Next Gemini Model (--flip)",
+        true,
+        None,
+    );
     let item_restart = MenuItem::with_id(
         id_restart_router.clone(),
         "Start / Restart Router Daemon",
@@ -247,6 +254,7 @@ fn main() {
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&item_flash);
     let _ = tray_menu.append(&item_argon);
+    let _ = tray_menu.append(&item_flip);
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&item_restart);
     let _ = tray_menu.append(&item_adc_login);
@@ -477,6 +485,7 @@ fn main() {
                     let id_codex = id_toggle_codex.clone();
                     let id_flash = id_model_flash.clone();
                     let id_argon = id_model_argon.clone();
+                    let id_flip = id_model_flip.clone();
                     let id_restart = id_restart_router.clone();
                     let id_login = id_adc_login.clone();
 
@@ -486,9 +495,31 @@ fn main() {
                         } else if menu_id == id_codex {
                             let _ = ctl::cmd_toggle("codex");
                         } else if menu_id == id_flash {
-                            let _ = ctl::cmd_set_model(Some("gemini-3.8-flash"), None, false);
+                            let _ = ctl::cmd_set_model(
+                                Some("gemini-3.8-flash"),
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            );
                         } else if menu_id == id_argon {
-                            let _ = ctl::cmd_set_model(Some("gemini-4-argon"), None, false);
+                            let _ = ctl::cmd_set_model(
+                                Some("gemini-4-argon"),
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            );
+                        } else if menu_id == id_flip {
+                            let _ = ctl::cmd_set_model(
+                                None, None, true, None, None, None, None, None,
+                            );
                         } else if menu_id == id_restart {
                             let _ = ctl::cmd_restart_router();
                         } else if menu_id == id_login {

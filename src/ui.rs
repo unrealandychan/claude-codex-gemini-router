@@ -569,6 +569,36 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     color: var(--fg);
   }
 
+  .model-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 8px;
+    width: 100%;
+  }
+
+  .custom-model-input {
+    flex: 1;
+    height: 26px;
+    padding: 0 8px;
+    border-radius: 4px;
+    background: rgba(205, 214, 244, 0.06);
+    border: 1px solid rgba(205, 214, 244, 0.16);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    outline: none;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  .custom-model-input:focus {
+    border-color: var(--accent);
+  }
+
+  .custom-model-input::placeholder {
+    color: var(--muted);
+  }
+
   /* ──────────────── Info Rows ──────────────── */
   .info-row {
     display: flex;
@@ -710,16 +740,30 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     <!-- ──────────────── Model & Effort Selector Card ──────────────── -->
     <div class="border-surface">
       <div class="row-layout tight">
-        <div class="section-label">Active Vertex AI Gemini Model</div>
-        <div id="hotSwapLabel" class="section-hint">Haiku -> 3.8 · Hot-Swap Ready</div>
+        <div id="activeModelHeaderLabel" class="section-label">Active Vertex AI Gemini Model (gemini-3.8-flash)</div>
+        <div id="hotSwapLabel" class="section-hint">Hot-Swap Ready</div>
       </div>
 
-      <div class="row-layout">
+      <div id="modelPresetsGrid" class="model-grid">
         <button id="btnModel38" class="btn fill selected-accent" onclick="runAction(['set-model', '--model', 'gemini-3.8-flash'], 'Switched model to gemini-3.8-flash')">
           Gemini 3.8 Flash
         </button>
         <button id="btnModel40" class="btn fill" onclick="runAction(['set-model', '--model', 'gemini-4-argon'], 'Switched model to gemini-4-argon')">
           Gemini 4.0 Argon
+        </button>
+      </div>
+
+      <div class="row-layout tight">
+        <input
+          id="customModelInput"
+          type="text"
+          class="custom-model-input"
+          placeholder="Custom model ID (e.g. gemini-2.5-pro, gemini-3.1-pro-preview)…"
+          onkeydown="if (event.key === 'Enter') useCustomModel()"
+          oninput="renderState()"
+        />
+        <button id="btnUseCustomModel" class="btn compact" onclick="useCustomModel()">
+          Use Model
         </button>
       </div>
 
@@ -778,6 +822,11 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     anyEnabled: false,
     bothEnabled: false,
     primaryModel: "gemini-3.8-flash",
+    primaryModelDisplay: "Gemini 3.8 Flash",
+    modelPresets: [
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", short: "Gemini 3.8", badge: "G3.8" },
+      { id: "gemini-4-argon", label: "Gemini 4.0 Argon", short: "Gemini 4.0", badge: "G4" }
+    ],
     reasoningEffort: "medium",
     hotSwapActive: false,
     badgeText: "ADC Off",
@@ -844,6 +893,10 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     if (data.any_enabled !== undefined) state.anyEnabled = data.any_enabled === true;
     if (data.both_enabled !== undefined) state.bothEnabled = data.both_enabled === true;
     if (data.primary_model) state.primaryModel = data.primary_model;
+    if (data.primary_model_display) state.primaryModelDisplay = data.primary_model_display;
+    if (Array.isArray(data.model_presets) && data.model_presets.length > 0) {
+      state.modelPresets = data.model_presets;
+    }
     if (data.reasoning_effort) state.reasoningEffort = data.reasoning_effort;
     if (data.hot_swap_active !== undefined) state.hotSwapActive = data.hot_swap_active === true;
     if (data.badge_text) state.badgeText = data.badge_text;
@@ -927,16 +980,32 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     btnToggleCodex.className = "btn" + (state.codexEnabled ? " selected-green" : "");
 
     // Model & Effort
+    const activeModelHeaderLabel = document.getElementById("activeModelHeaderLabel");
+    if (activeModelHeaderLabel) {
+      activeModelHeaderLabel.textContent = "Active Vertex AI Gemini Model (" + state.primaryModel + ")";
+    }
     const hotSwapLabel = document.getElementById("hotSwapLabel");
     hotSwapLabel.className = "section-hint" + (state.hotSwapActive ? " hotswap" : "");
 
-    const btnModel38 = document.getElementById("btnModel38");
-    btnModel38.disabled = state.isBusy;
-    btnModel38.className = "btn fill" + (state.primaryModel === "gemini-3.8-flash" ? " selected-accent" : "");
+    const presetsGrid = document.getElementById("modelPresetsGrid");
+    if (presetsGrid) {
+      presetsGrid.innerHTML = "";
+      for (const preset of state.modelPresets) {
+        const btn = document.createElement("button");
+        btn.className = "btn fill" + (state.primaryModel === preset.id ? " selected-accent" : "");
+        btn.disabled = state.isBusy;
+        btn.title = preset.id || "";
+        btn.textContent = preset.label || preset.id;
+        btn.onclick = () => runAction(["set-model", "--model", preset.id], "Switched model to " + preset.id);
+        presetsGrid.appendChild(btn);
+      }
+    }
 
-    const btnModel40 = document.getElementById("btnModel40");
-    btnModel40.disabled = state.isBusy;
-    btnModel40.className = "btn fill" + (state.primaryModel === "gemini-4-argon" ? " selected-accent" : "");
+    const customInput = document.getElementById("customModelInput");
+    const btnUseCustom = document.getElementById("btnUseCustomModel");
+    if (btnUseCustom && customInput) {
+      btnUseCustom.disabled = state.isBusy || customInput.value.trim().length === 0;
+    }
 
     const efforts = [
       ["low", "btnEffortLow"],
@@ -1028,6 +1097,15 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
       ["toggle", "--target", "codex"],
       state.codexEnabled ? "Disabling Codex routing…" : "Routing OpenAI Codex to Gemini…"
     );
+  }
+
+  function useCustomModel() {
+    const input = document.getElementById("customModelInput");
+    if (!input || state.isBusy) return;
+    const val = input.value.trim();
+    if (!val) return;
+    input.value = "";
+    runAction(["set-model", "--model", val], "Switched model to " + val);
   }
 
   function startOrRestartDaemon() {
