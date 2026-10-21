@@ -1,0 +1,9 @@
+/target/
+/dist/
+/omarchy-plugin/bin/
+*.tar.gz
+*.zip
+.DS_Store
+Thumbs.db
+*.log
+*.swp

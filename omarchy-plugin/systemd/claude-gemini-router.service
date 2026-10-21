@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code & OpenAI Codex -> Vertex AI Gemini ADC Router (Rust)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/gemini-router/router.env
+EnvironmentFile=-%h/.config/omarchy/gemini-router/router.env
+ExecStart=%h/.local/bin/claude-gemini-router --host 127.0.0.1 --port 4000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
