@@ -33,6 +33,10 @@ if ($PrintEnvOnly) {
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:GOOGLE_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_HAIKU -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_SONNET -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_OPUS -ErrorAction SilentlyContinue
 `$env:CLAUDE_CODE_USE_VERTEX = "0"
 `$env:ANTHROPIC_BASE_URL = "$RouterUrl"
 `$env:ANTHROPIC_AUTH_TOKEN = "adc-keyless"
@@ -41,7 +45,6 @@ Remove-Item Env:GOOGLE_API_KEY -ErrorAction SilentlyContinue
 `$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "claude-haiku-4-5"
 `$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "$PrimaryModel[1m]"
 `$env:ANTHROPIC_DEFAULT_OPUS_MODEL = "$PrimaryModel[1m]"
-`$env:DISABLE_PROMPT_CACHING = "1"
 "@
     exit 0
 }
@@ -88,6 +91,10 @@ if (-not (Test-RouterHealth)) {
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:GOOGLE_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_HAIKU -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_SONNET -ErrorAction SilentlyContinue
+Remove-Item Env:DISABLE_PROMPT_CACHING_OPUS -ErrorAction SilentlyContinue
 $env:CLAUDE_CODE_USE_VERTEX = "0"
 $env:ANTHROPIC_BASE_URL = $RouterUrl
 $env:ANTHROPIC_AUTH_TOKEN = "adc-keyless"
@@ -96,7 +103,6 @@ $env:ANTHROPIC_SMALL_FAST_MODEL = "claude-haiku-4-5"
 $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "claude-haiku-4-5"
 $env:ANTHROPIC_DEFAULT_SONNET_MODEL = "$PrimaryModel[1m]"
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL = "$PrimaryModel[1m]"
-$env:DISABLE_PROMPT_CACHING = "1"
 
 $SettingsOverride = (@{
     env = @{
@@ -108,7 +114,6 @@ $SettingsOverride = (@{
         ANTHROPIC_DEFAULT_HAIKU_MODEL = "claude-haiku-4-5"
         ANTHROPIC_DEFAULT_SONNET_MODEL = "$PrimaryModel[1m]"
         ANTHROPIC_DEFAULT_OPUS_MODEL = "$PrimaryModel[1m]"
-        DISABLE_PROMPT_CACHING = "1"
     }
 } | ConvertTo-Json -Compress)
 

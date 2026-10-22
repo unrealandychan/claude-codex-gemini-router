@@ -193,7 +193,9 @@ impl ADCAuthManager {
         {
             let script = format!(
                 "display notification \"{}\" with title \"{}\"",
-                body.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " "),
+                body.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', " "),
                 title.replace('\\', "\\\\").replace('"', "\\\"")
             );
             let _ = Command::new("osascript").args(["-e", &script]).spawn();
@@ -207,7 +209,14 @@ impl ADCAuthManager {
                 body.replace('\'', "''").replace('\n', " ")
             );
             let mut cmd = Command::new("powershell");
-            cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_script]);
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps_script,
+            ]);
             configure_background_command(&mut cmd);
             let _ = cmd.spawn();
         }
@@ -215,14 +224,7 @@ impl ADCAuthManager {
         #[cfg(target_os = "linux")]
         {
             let _ = Command::new("notify-send")
-                .args([
-                    "-u",
-                    "critical",
-                    "-a",
-                    "Gemini ADC Router",
-                    &title,
-                    &body,
-                ])
+                .args(["-u", "critical", "-a", "Gemini ADC Router", &title, &body])
                 .spawn();
         }
     }
@@ -396,7 +398,9 @@ impl ADCAuthManager {
         {
             candidates.push(home.join("google-cloud-sdk/bin/gcloud"));
             candidates.push(PathBuf::from("/opt/homebrew/bin/gcloud"));
-            candidates.push(PathBuf::from("/opt/homebrew/share/google-cloud-sdk/bin/gcloud"));
+            candidates.push(PathBuf::from(
+                "/opt/homebrew/share/google-cloud-sdk/bin/gcloud",
+            ));
             candidates.push(PathBuf::from(
                 "/usr/local/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/bin/gcloud",
             ));
@@ -481,46 +485,67 @@ impl ADCAuthManager {
                             ("refresh_token", rtok),
                             ("grant_type", "refresh_token"),
                         ];
-                        match self.http_client.post(token_uri).form(&params).send().await {
-                            Ok(resp) => {
-                                let status = resp.status();
-                                if let Ok(body) = resp.json::<Value>().await {
-                                    if status.is_success() {
-                                        if let Some(tok) =
-                                            body.get("access_token").and_then(|v| v.as_str())
-                                        {
-                                            let expires_in = body
-                                                .get("expires_in")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(3600);
-                                            let margin = std::cmp::min(300, expires_in / 2);
-                                            let refresh_after_epoch = Self::now_epoch_secs()
-                                                .saturating_add(expires_in.saturating_sub(margin));
-                                            let token_str = tok.to_string();
-                                            if rejected_tok.as_deref() != Some(token_str.as_str()) {
-                                                *self.last_rejected_token.lock().unwrap() = None;
-                                                *self.cached_token.lock().unwrap() =
-                                                    Some(CachedToken {
-                                                        access_token: token_str.clone(),
-                                                        refresh_after_epoch,
-                                                        adc_fingerprint: Self::adc_fingerprint(),
-                                                    });
-                                                return Ok(token_str);
-                                            }
-                                            oauth_candidate = Some(token_str);
-                                        }
-                                    } else {
-                                        let desc = body
-                                            .get("error_description")
-                                            .or_else(|| body.get("error"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("OAuth2 refresh failed");
-                                        oauth_err = Some(desc.to_string());
-                                    }
-                                }
+                        for attempt in 0..3u32 {
+                            if attempt > 0 {
+                                tokio::time::sleep(Duration::from_millis(150 * (attempt as u64)))
+                                    .await;
                             }
-                            Err(e) => {
-                                oauth_err = Some(e.to_string());
+                            match self.http_client.post(token_uri).form(&params).send().await {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    let code = status.as_u16();
+                                    if matches!(code, 408 | 429 | 500 | 502 | 503 | 504)
+                                        && attempt < 2
+                                    {
+                                        oauth_err = Some(format!("OAuth2 refresh HTTP {}", code));
+                                        continue;
+                                    }
+                                    if let Ok(body) = resp.json::<Value>().await {
+                                        if status.is_success() {
+                                            if let Some(tok) =
+                                                body.get("access_token").and_then(|v| v.as_str())
+                                            {
+                                                let expires_in = body
+                                                    .get("expires_in")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(3600);
+                                                let margin = std::cmp::min(300, expires_in / 2);
+                                                let refresh_after_epoch = Self::now_epoch_secs()
+                                                    .saturating_add(
+                                                        expires_in.saturating_sub(margin),
+                                                    );
+                                                let token_str = tok.to_string();
+                                                if rejected_tok.as_deref()
+                                                    != Some(token_str.as_str())
+                                                {
+                                                    *self.last_rejected_token.lock().unwrap() =
+                                                        None;
+                                                    *self.last_auth_failure.lock().unwrap() = None;
+                                                    *self.cached_token.lock().unwrap() =
+                                                        Some(CachedToken {
+                                                            access_token: token_str.clone(),
+                                                            refresh_after_epoch,
+                                                            adc_fingerprint: Self::adc_fingerprint(
+                                                            ),
+                                                        });
+                                                    return Ok(token_str);
+                                                }
+                                                oauth_candidate = Some(token_str);
+                                            }
+                                        } else {
+                                            let desc = body
+                                                .get("error_description")
+                                                .or_else(|| body.get("error"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("OAuth2 refresh failed");
+                                            oauth_err = Some(desc.to_string());
+                                        }
+                                    }
+                                    break;
+                                }
+                                Err(e) => {
+                                    oauth_err = Some(e.to_string());
+                                }
                             }
                         }
                     }
@@ -530,13 +555,19 @@ impl ADCAuthManager {
 
         let gcloud_bin = Self::find_gcloud_binary();
         let mut cmd = Command::new(&gcloud_bin);
-        cmd.args(["auth", "application-default", "print-access-token", "--quiet"]);
+        cmd.args([
+            "auth",
+            "application-default",
+            "print-access-token",
+            "--quiet",
+        ]);
         configure_background_command(&mut cmd);
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 let token_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !token_str.is_empty() && rejected_tok.as_deref() != Some(token_str.as_str()) {
                     *self.last_rejected_token.lock().unwrap() = None;
+                    *self.last_auth_failure.lock().unwrap() = None;
                     *self.cached_token.lock().unwrap() = Some(CachedToken {
                         access_token: token_str.clone(),
                         refresh_after_epoch: Self::now_epoch_secs().saturating_add(3000),
@@ -552,11 +583,6 @@ impl ADCAuthManager {
         }
 
         if let Some(candidate) = oauth_candidate {
-            *self.cached_token.lock().unwrap() = Some(CachedToken {
-                access_token: candidate.clone(),
-                refresh_after_epoch: Self::now_epoch_secs().saturating_add(3300),
-                adc_fingerprint: Self::adc_fingerprint(),
-            });
             return Ok(candidate);
         }
 

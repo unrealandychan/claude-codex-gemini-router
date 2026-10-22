@@ -4,9 +4,31 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROUTER_ENV_FILE="${HOME}/.config/omarchy/gemini-router/router.env"
+if [[ ! -f "${ROUTER_ENV_FILE}" && -f "${HOME}/.config/gemini-router/router.env" ]]; then
+  ROUTER_ENV_FILE="${HOME}/.config/gemini-router/router.env"
+fi
+
+read_env_key() {
+  local key="$1"
+  local file="$2"
+  if [[ -f "$file" && ! -L "$file" ]]; then
+    awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit }' "$file"
+  fi
+}
+
+if [[ -z "${ROUTER_PORT:-}" ]]; then
+  ROUTER_PORT="$(read_env_key "ROUTER_PORT" "${ROUTER_ENV_FILE}")"
+fi
 ROUTER_PORT="${ROUTER_PORT:-4000}"
 ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
 
+if [[ -z "${GEMINI_PRIMARY_MODEL:-}" ]]; then
+  GEMINI_PRIMARY_MODEL="$(read_env_key "GEMINI_PRIMARY_MODEL" "${ROUTER_ENV_FILE}")"
+fi
+if [[ -z "${GEMINI_REASONING_EFFORT:-}" ]]; then
+  GEMINI_REASONING_EFFORT="$(read_env_key "GEMINI_REASONING_EFFORT" "${ROUTER_ENV_FILE}")"
+fi
 PRIMARY_MODEL="${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}"
 REASONING_EFFORT="${GEMINI_REASONING_EFFORT:-medium}"
 PRINT_ENV_ONLY=false

@@ -1,10 +1,11 @@
 use crate::adc_auth::ADCAuthManager;
 use crate::translator::{
     anthropic_to_gemini_request, default_fast_gemini_model, default_gemini_model,
-    extract_candidate_parts, format_model_display_name, format_sse, gemini_to_anthropic_response,
+    extract_anthropic_cache_hint, extract_candidate_parts, extract_usage_counts,
+    format_model_display_name, format_sse, gemini_to_anthropic_response_with_hint,
     gemini_to_openai_chat_response, gemini_to_openai_responses, openai_chat_to_gemini_request,
-    openai_responses_to_gemini_request, resolve_gemini_model, AnthropicStreamState,
-    DEFAULT_GEMINI_MODEL, SIGNATURE_STORE,
+    openai_responses_to_gemini_request, record_response_cache_state, resolve_gemini_model,
+    AnthropicStreamState, DEFAULT_GEMINI_MODEL, SIGNATURE_STORE,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -27,7 +28,12 @@ pub const DEFAULT_AVAILABLE_MODELS: &[&str] = &[
 ];
 
 fn short_id(len: usize) -> String {
-    Uuid::new_v4().simple().to_string().chars().take(len).collect()
+    Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(len)
+        .collect()
 }
 
 pub fn fallback_model_for(model: &str) -> Option<&'static str> {
@@ -94,9 +100,7 @@ impl RouterMetrics {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(|m| resolve_gemini_model(Some(&m)));
-        let active = env_model
-            .clone()
-            .unwrap_or_else(default_gemini_model);
+        let active = env_model.clone().unwrap_or_else(default_gemini_model);
         let fast_model = std::env::var("GEMINI_FAST_MODEL")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -170,7 +174,12 @@ impl RouterMetrics {
         self.record_client_request("claude", model, model);
     }
 
-    pub fn record_client_request(&self, client_kind: &str, requested_model: &str, vertex_model: &str) {
+    pub fn record_client_request(
+        &self,
+        client_kind: &str,
+        requested_model: &str,
+        vertex_model: &str,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.requests_total += 1;
         match client_kind {
@@ -178,7 +187,11 @@ impl RouterMetrics {
             "codex" => g.codex_requests += 1,
             _ => g.chat_requests += 1,
         }
-        g.active_model = vertex_model.to_string();
+        if let Some(ref def_model) = g.default_model_override {
+            g.active_model = def_model.clone();
+        } else {
+            g.active_model = vertex_model.to_string();
+        }
         g.last_client = Some(client_kind.to_string());
         g.last_requested_model = Some(requested_model.to_string());
         g.last_vertex_model = Some(vertex_model.to_string());
@@ -190,11 +203,35 @@ impl RouterMetrics {
         );
     }
 
+    pub fn record_used_model(&self, used_model: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.last_vertex_model = Some(used_model.to_string());
+        if g.default_model_override.is_none() {
+            g.active_model = used_model.to_string();
+        }
+    }
+
     pub fn record_success(&self, tokens_in: u64, tokens_out: u64) {
+        self.record_usage(tokens_in, tokens_out, 0, 0, None);
+    }
+
+    pub fn record_usage(
+        &self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cached_tokens: u64,
+        reasoning_tokens: u64,
+        latency_ms: Option<u64>,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.requests_ok += 1;
         g.tokens_in += tokens_in;
         g.tokens_out += tokens_out;
+        g.cached_tokens += cached_tokens;
+        g.reasoning_tokens += reasoning_tokens;
+        if let Some(ms) = latency_ms {
+            g.last_latency_ms = Some(ms);
+        }
     }
 
     pub fn record_error(&self) {
@@ -316,6 +353,8 @@ impl RouterMetrics {
             "requests_err": g.requests_err,
             "tokens_in": g.tokens_in,
             "tokens_out": g.tokens_out,
+            "cached_tokens": g.cached_tokens,
+            "reasoning_tokens": g.reasoning_tokens,
             "active_model": g.active_model,
             "default_model_override": g.default_model_override,
             "fast_model_override": g.fast_model_override,
@@ -389,10 +428,10 @@ impl VertexGeminiUpstream {
             }
         }
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .connect_timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(30))
+            .timeout(Duration::from_secs(3600))
+            .connect_timeout(Duration::from_secs(20))
+            .pool_idle_timeout(Duration::from_secs(15))
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .unwrap_or_default();
         Self {
@@ -438,34 +477,63 @@ impl VertexGeminiUpstream {
         model: &str,
         payload: &Value,
     ) -> std::result::Result<Value, UpstreamError> {
-        for attempt in 0..2 {
-            let url = self.build_endpoint_url(model, false).map_err(|e| UpstreamError {
-                status_code: 500,
-                message: e.to_string(),
-                details: None,
-            })?;
+        let mut auth_retried = false;
+        let mut last_err: Option<UpstreamError> = None;
+        for attempt in 0..4u32 {
+            let url = self
+                .build_endpoint_url(model, false)
+                .map_err(|e| UpstreamError {
+                    status_code: 500,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
-            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-                status_code: 401,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let headers = self
+                .auth
+                .get_auth_headers()
+                .await
+                .map_err(|e| UpstreamError {
+                    status_code: 401,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
             let mut req = self.client.post(&url).json(payload);
             for (k, v) in headers {
                 req = req.header(&k, &v);
             }
 
-            let resp = req.send().await.map_err(|e| UpstreamError {
-                status_code: 502,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = UpstreamError {
+                        status_code: 502,
+                        message: e.to_string(),
+                        details: None,
+                    };
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            if (status == 401 || status == 403) && attempt == 0 {
+            if (status == 401 || status == 403) && !auth_retried {
+                auth_retried = true;
                 self.auth.prepare_auth_retry();
+                continue;
+            }
+            if matches!(status, 408 | 429 | 500 | 502 | 503 | 504) && attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
+                last_err = Some(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI error ({}): {}", status, text),
+                    details: serde_json::from_str::<Value>(&text).ok(),
+                });
                 continue;
             }
             if status >= 400 {
@@ -487,6 +555,9 @@ impl VertexGeminiUpstream {
             });
         }
 
+        if let Some(err) = last_err {
+            return Err(err);
+        }
         self.auth
             .record_auth_failure(401, "Vertex AI authentication failed after token refresh");
         Err(UpstreamError {
@@ -503,33 +574,63 @@ impl VertexGeminiUpstream {
     ) -> std::result::Result<mpsc::Receiver<std::result::Result<Value, UpstreamError>>, UpstreamError>
     {
         let mut resp_opt = None;
-        for attempt in 0..2 {
-            let url = self.build_endpoint_url(model, true).map_err(|e| UpstreamError {
-                status_code: 500,
-                message: e.to_string(),
-                details: None,
-            })?;
+        let mut auth_retried = false;
+        let mut last_err: Option<UpstreamError> = None;
+        for attempt in 0..4u32 {
+            let url = self
+                .build_endpoint_url(model, true)
+                .map_err(|e| UpstreamError {
+                    status_code: 500,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
-            let headers = self.auth.get_auth_headers().await.map_err(|e| UpstreamError {
-                status_code: 401,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let headers = self
+                .auth
+                .get_auth_headers()
+                .await
+                .map_err(|e| UpstreamError {
+                    status_code: 401,
+                    message: e.to_string(),
+                    details: None,
+                })?;
 
             let mut req = self.client.post(&url).json(payload);
             for (k, v) in headers {
                 req = req.header(&k, &v);
             }
 
-            let resp = req.send().await.map_err(|e| UpstreamError {
-                status_code: 502,
-                message: e.to_string(),
-                details: None,
-            })?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = UpstreamError {
+                        status_code: 502,
+                        message: e.to_string(),
+                        details: None,
+                    };
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let status = resp.status().as_u16();
-            if (status == 401 || status == 403) && attempt == 0 {
+            if (status == 401 || status == 403) && !auth_retried {
+                auth_retried = true;
                 self.auth.prepare_auth_retry();
+                continue;
+            }
+            if matches!(status, 408 | 429 | 500 | 502 | 503 | 504) && attempt < 3 {
+                let text = resp.text().await.unwrap_or_default();
+                tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
+                last_err = Some(UpstreamError {
+                    status_code: status,
+                    message: format!("Vertex AI stream error ({}): {}", status, text),
+                    details: serde_json::from_str::<Value>(&text).ok(),
+                });
                 continue;
             }
             if status >= 400 {
@@ -549,40 +650,74 @@ impl VertexGeminiUpstream {
             break;
         }
 
-        let mut resp = resp_opt.ok_or_else(|| {
-            self.auth.record_auth_failure(
-                401,
-                "Vertex AI stream authentication failed after token refresh",
-            );
-            UpstreamError {
-                status_code: 401,
-                message: "Vertex AI stream authentication failed after token refresh".to_string(),
-                details: None,
+        let mut resp = match resp_opt {
+            Some(r) => r,
+            None => {
+                if let Some(err) = last_err {
+                    return Err(err);
+                }
+                self.auth.record_auth_failure(
+                    401,
+                    "Vertex AI stream authentication failed after token refresh",
+                );
+                return Err(UpstreamError {
+                    status_code: 401,
+                    message: "Vertex AI stream authentication failed after token refresh"
+                        .to_string(),
+                    details: None,
+                });
             }
-        })?;
+        };
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
-            let mut buffer = String::new();
-            while let Ok(Some(chunk)) = resp.chunk().await {
-                let s = String::from_utf8_lossy(&chunk);
-                buffer.push_str(&s);
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer.drain(..=pos);
-                    if let Some(data_str) = line.strip_prefix("data:") {
-                        let data_str = data_str.trim();
-                        if !data_str.is_empty() && data_str != "[DONE]" {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(data_str) {
-                                if tx.send(Ok(parsed)).await.is_err() {
-                                    return;
+            let mut raw_buf: Vec<u8> = Vec::with_capacity(8192);
+            loop {
+                match tokio::time::timeout(Duration::from_secs(600), resp.chunk()).await {
+                    Ok(Ok(Some(chunk))) => {
+                        raw_buf.extend_from_slice(&chunk);
+                        while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = raw_buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            let line = line.trim();
+                            if let Some(data_str) = line.strip_prefix("data:") {
+                                let data_str = data_str.trim();
+                                if !data_str.is_empty() && data_str != "[DONE]" {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(data_str) {
+                                        if tx.send(Ok(parsed)).await.is_err() {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(UpstreamError {
+                                status_code: 502,
+                                message: format!("Vertex AI stream interrupted: {}", e),
+                                details: None,
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(UpstreamError {
+                                status_code: 504,
+                                message: "Vertex AI stream timed out waiting for next chunk"
+                                    .to_string(),
+                                details: None,
+                            }))
+                            .await;
+                        return;
+                    }
                 }
             }
-            let rem = buffer.trim();
+            let rem = String::from_utf8_lossy(&raw_buf);
+            let rem = rem.trim();
             if let Some(data_str) = rem.strip_prefix("data:") {
                 let data_str = data_str.trim();
                 if !data_str.is_empty() && data_str != "[DONE]" {
@@ -662,15 +797,16 @@ impl RouterServer {
                         Value::String("gemini-3.8-flash".to_string()),
                     );
                 } else {
-                    let is_primary_gemini = matches!(
-                        lower.as_str(),
-                        "gemini-3.8-flash"
-                            | "gemini-4-argon"
-                            | "gemini-3.8"
-                            | "gemini-4.0"
-                            | "gemini-4.0-pro"
-                            | "gemini-3.1-pro-preview"
-                    ) || self.metrics.get_available_models().contains(&lower);
+                    let is_primary_gemini =
+                        matches!(
+                            lower.as_str(),
+                            "gemini-3.8-flash"
+                                | "gemini-4-argon"
+                                | "gemini-3.8"
+                                | "gemini-4.0"
+                                | "gemini-4.0-pro"
+                                | "gemini-3.1-pro-preview"
+                        ) || self.metrics.get_available_models().contains(&lower);
                     if lower.is_empty()
                         || !lower.starts_with("gemini-")
                         || hot_swap
@@ -704,16 +840,17 @@ impl RouterServer {
         }
         if let Ok(env_fb) = std::env::var("GEMINI_FALLBACK_MODEL") {
             let trimmed = env_fb.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("none")
+                && !trimmed.eq_ignore_ascii_case("off")
+            {
                 let resolved = resolve_gemini_model(Some(trimmed));
                 if resolved != model {
                     return Some(resolved);
                 }
             }
         }
-        fallback_model_for(model)
-            .map(|s| s.to_string())
-            .filter(|fb| fb != model)
+        None
     }
 
     pub async fn generate_with_fallback(
@@ -725,7 +862,7 @@ impl RouterServer {
             Ok(resp) => Ok((model.to_string(), resp)),
             Err(err) => {
                 if let Some(fallback) = self.resolve_fallback_model(model) {
-                    if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
+                    if matches!(err.status_code, 404 | 429 | 500 | 502 | 503 | 504) {
                         self.metrics.inner.lock().unwrap().fallback_count += 1;
                         match self.upstream.generate_content(&fallback, payload).await {
                             Ok(resp) => return Ok((fallback, resp)),
@@ -762,9 +899,13 @@ impl RouterServer {
             Ok(rx) => Ok((model.to_string(), rx)),
             Err(err) => {
                 if let Some(fallback) = self.resolve_fallback_model(model) {
-                    if matches!(err.status_code, 400 | 403 | 404 | 429 | 500 | 503) {
+                    if matches!(err.status_code, 404 | 429 | 500 | 502 | 503 | 504) {
                         self.metrics.inner.lock().unwrap().fallback_count += 1;
-                        match self.upstream.stream_generate_content(&fallback, payload).await {
+                        match self
+                            .upstream
+                            .stream_generate_content(&fallback, payload)
+                            .await
+                        {
                             Ok(rx) => return Ok((fallback, rx)),
                             Err(fb_err) => {
                                 if fb_err.status_code == 401 || fb_err.status_code == 403 {
@@ -836,20 +977,11 @@ impl RouterServer {
                 if let Some(obj) = status.as_object_mut() {
                     obj.insert("status".to_string(), Value::String("ok".to_string()));
                     obj.insert("adc".to_string(), adc_status);
-                    obj.insert(
-                        "default_model".to_string(),
-                        Value::String(default_model),
-                    );
-                    obj.insert(
-                        "primary_model".to_string(),
-                        Value::String(primary_model),
-                    );
+                    obj.insert("default_model".to_string(), Value::String(default_model));
+                    obj.insert("primary_model".to_string(), Value::String(primary_model));
                     obj.insert("fast_model".to_string(), Value::String(fast_model));
                     obj.insert("fallback_model".to_string(), fallback_model);
-                    obj.insert(
-                        "available_models".to_string(),
-                        json!(available_models),
-                    );
+                    obj.insert("available_models".to_string(), json!(available_models));
                     obj.insert(
                         "reasoning_effort".to_string(),
                         Value::String(self.metrics.get_reasoning_effort()),
@@ -896,7 +1028,11 @@ impl RouterServer {
                 {
                     if !m.trim().is_empty() {
                         self.metrics.set_default_model(m.trim());
-                        if body.get("hot_swap").and_then(|v| v.as_bool()).unwrap_or(true) {
+                        if body
+                            .get("hot_swap")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                        {
                             self.metrics.set_hot_swap_active(true);
                         }
                     }
@@ -913,7 +1049,11 @@ impl RouterServer {
                 if let Some(e) = body.get("reasoning_effort").and_then(|v| v.as_str()) {
                     if !e.trim().is_empty() {
                         self.metrics.set_reasoning_effort(e.trim());
-                        if body.get("hot_swap").and_then(|v| v.as_bool()).unwrap_or(true) {
+                        if body
+                            .get("hot_swap")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                        {
                             self.metrics.set_hot_swap_active(true);
                         }
                     }
@@ -1025,10 +1165,15 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or(DEFAULT_GEMINI_MODEL)
                     .to_string();
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let (gemini_model, gemini_payload) = anthropic_to_gemini_request(&body);
+                let cache_hint = extract_anthropic_cache_hint(&body, &gemini_payload);
                 self.metrics
                     .record_client_request("claude", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -1036,22 +1181,30 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            let mut g = self.metrics.inner.lock().unwrap();
-                            g.active_model = used_model;
-                            drop(g);
+                            self.metrics.record_used_model(&used_model);
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, _cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            let resp = gemini_to_anthropic_response_with_hint(
+                                &gemini_resp,
+                                &requested_model,
+                                Some(&cache_hint),
                             );
-                            let resp =
-                                gemini_to_anthropic_response(&gemini_resp, &requested_model);
+                            let eff_cached = resp
+                                .get("usage")
+                                .and_then(|u| u.get("cache_read_input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                eff_cached,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
+                            );
                             RouterResponse::Json(200, resp)
                         }
                         Err(err) => {
@@ -1074,11 +1227,14 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
                             tokio::spawn(async move {
-                                let mut state = AnthropicStreamState::new(&requested_model);
+                                let mut state = AnthropicStreamState::with_cache_hint(
+                                    &requested_model,
+                                    cache_hint,
+                                );
                                 while let Some(item) = chunk_rx.recv().await {
                                     match item {
                                         Ok(chunk) => {
@@ -1108,7 +1264,13 @@ impl RouterServer {
                                         return;
                                     }
                                 }
-                                metrics.record_success(state.input_tokens, state.output_tokens);
+                                metrics.record_usage(
+                                    state.input_tokens,
+                                    state.output_tokens,
+                                    state.cached_tokens,
+                                    state.reasoning_tokens,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }
@@ -1144,10 +1306,14 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or(DEFAULT_GEMINI_MODEL)
                     .to_string();
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let (gemini_model, gemini_payload) = openai_chat_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("chat", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -1155,17 +1321,19 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                cached_tok,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
                             );
                             let resp =
                                 gemini_to_openai_chat_response(&gemini_resp, &requested_model);
@@ -1191,7 +1359,7 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
                             tokio::spawn(async move {
@@ -1205,8 +1373,30 @@ impl RouterServer {
                                 let mut tool_idx = 0usize;
                                 let mut tok_in = 0u64;
                                 let mut tok_out = 0u64;
+                                let mut cached_tok = 0u64;
+                                let mut reasoning_tok = 0u64;
 
-                                while let Some(Ok(chunk)) = chunk_rx.recv().await {
+                                while let Some(item) = chunk_rx.recv().await {
+                                    let chunk = match item {
+                                        Ok(c) => c,
+                                        Err(err) => {
+                                            metrics.record_error();
+                                            let _ = tx
+                                                .send(format_sse(
+                                                    None,
+                                                    &json!({
+                                                        "error": {
+                                                            "message": err.message,
+                                                            "type": "upstream_error",
+                                                            "code": err.status_code,
+                                                        }
+                                                    }),
+                                                ))
+                                                .await;
+                                            let _ = tx.send("data: [DONE]\n\n".to_string()).await;
+                                            return;
+                                        }
+                                    };
                                     let (parts, _finish, usage) = extract_candidate_parts(&chunk);
                                     if let Some(pt) =
                                         usage.get("promptTokenCount").and_then(|v| v.as_u64())
@@ -1217,6 +1407,17 @@ impl RouterServer {
                                         usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
                                     {
                                         tok_out = ct;
+                                    }
+                                    if let Some(cached) = usage
+                                        .get("cachedContentTokenCount")
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        cached_tok = cached;
+                                    }
+                                    if let Some(thoughts) =
+                                        usage.get("thoughtsTokenCount").and_then(|v| v.as_u64())
+                                    {
+                                        reasoning_tok = thoughts;
                                     }
                                     if !sent_role {
                                         sent_role = true;
@@ -1319,7 +1520,8 @@ impl RouterServer {
                                         }
                                     }
                                 }
-                                let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+                                let finish_reason =
+                                    if has_tool_calls { "tool_calls" } else { "stop" };
                                 let _ = tx
                                     .send(format_sse(
                                         None,
@@ -1332,12 +1534,29 @@ impl RouterServer {
                                                 "index": 0,
                                                 "delta": {},
                                                 "finish_reason": finish_reason,
-                                            }]
+                                            }],
+                                            "usage": {
+                                                "prompt_tokens": tok_in,
+                                                "prompt_tokens_details": {
+                                                    "cached_tokens": cached_tok,
+                                                },
+                                                "completion_tokens": tok_out,
+                                                "completion_tokens_details": {
+                                                    "reasoning_tokens": reasoning_tok,
+                                                },
+                                                "total_tokens": tok_in + tok_out,
+                                            }
                                         }),
                                     ))
                                     .await;
                                 let _ = tx.send("data: [DONE]\n\n".to_string()).await;
-                                metrics.record_success(tok_in, tok_out);
+                                metrics.record_usage(
+                                    tok_in,
+                                    tok_out,
+                                    cached_tok,
+                                    reasoning_tok,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }
@@ -1373,10 +1592,18 @@ impl RouterServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or(DEFAULT_GEMINI_MODEL)
                     .to_string();
-                let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                let stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let prompt_cache_key = body
+                    .get("prompt_cache_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let (gemini_model, gemini_payload) = openai_responses_to_gemini_request(&body);
                 self.metrics
                     .record_client_request("codex", &requested_model, &gemini_model);
+                let req_started = Instant::now();
 
                 if !stream {
                     match self
@@ -1384,19 +1611,32 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, gemini_resp)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let usage = gemini_resp
                                 .get("usageMetadata")
                                 .cloned()
                                 .unwrap_or_else(|| json!({}));
-                            self.metrics.record_success(
-                                usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
-                                usage
-                                    .get("candidatesTokenCount")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
+                            let (tok_in, tok_out, cached_tok, reasoning_tok) =
+                                extract_usage_counts(&usage);
+                            self.metrics.record_usage(
+                                tok_in,
+                                tok_out,
+                                cached_tok,
+                                reasoning_tok,
+                                Some(req_started.elapsed().as_millis() as u64),
                             );
                             let resp = gemini_to_openai_responses(&gemini_resp, &requested_model);
+                            if let (Some(resp_id), Some(output_arr)) = (
+                                resp.get("id").and_then(|v| v.as_str()),
+                                resp.get("output").and_then(|v| v.as_array()),
+                            ) {
+                                record_response_cache_state(
+                                    resp_id,
+                                    prompt_cache_key.as_deref(),
+                                    &gemini_payload,
+                                    output_arr,
+                                );
+                            }
                             RouterResponse::Json(200, resp)
                         }
                         Err(err) => {
@@ -1419,9 +1659,10 @@ impl RouterServer {
                         .await
                     {
                         Ok((used_model, mut chunk_rx)) => {
-                            self.metrics.inner.lock().unwrap().active_model = used_model;
+                            self.metrics.record_used_model(&used_model);
                             let (tx, rx) = mpsc::channel(64);
                             let metrics = self.metrics.clone();
+                            let gemini_payload_for_cache = gemini_payload.clone();
                             tokio::spawn(async move {
                                 let resp_id = format!("resp_{}", short_id(24));
                                 let msg_id = format!("msg_{}", short_id(24));
@@ -1433,6 +1674,8 @@ impl RouterServer {
                                 let mut output_items: Vec<Value> = Vec::new();
                                 let mut tok_in = 0u64;
                                 let mut tok_out = 0u64;
+                                let mut cached_tok = 0u64;
+                                let mut reasoning_tok = 0u64;
 
                                 let _ = tx
                                     .send(format_sse(
@@ -1451,7 +1694,33 @@ impl RouterServer {
                                     ))
                                     .await;
 
-                                while let Some(Ok(chunk)) = chunk_rx.recv().await {
+                                while let Some(item) = chunk_rx.recv().await {
+                                    let chunk = match item {
+                                        Ok(c) => c,
+                                        Err(err) => {
+                                            metrics.record_error();
+                                            let _ = tx
+                                                .send(format_sse(
+                                                    Some("response.failed"),
+                                                    &json!({
+                                                        "type": "response.failed",
+                                                        "response": {
+                                                            "id": resp_id,
+                                                            "object": "response",
+                                                            "created_at": created,
+                                                            "status": "failed",
+                                                            "model": requested_model,
+                                                            "error": {
+                                                                "message": err.message,
+                                                                "code": err.status_code,
+                                                            }
+                                                        }
+                                                    }),
+                                                ))
+                                                .await;
+                                            return;
+                                        }
+                                    };
                                     let (parts, _finish, usage) = extract_candidate_parts(&chunk);
                                     if let Some(pt) =
                                         usage.get("promptTokenCount").and_then(|v| v.as_u64())
@@ -1462,6 +1731,17 @@ impl RouterServer {
                                         usage.get("candidatesTokenCount").and_then(|v| v.as_u64())
                                     {
                                         tok_out = ct;
+                                    }
+                                    if let Some(cached) = usage
+                                        .get("cachedContentTokenCount")
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        cached_tok = cached;
+                                    }
+                                    if let Some(thoughts) =
+                                        usage.get("thoughtsTokenCount").and_then(|v| v.as_u64())
+                                    {
+                                        reasoning_tok = thoughts;
                                     }
                                     for part in parts {
                                         let pobj = match part.as_object() {
@@ -1559,6 +1839,13 @@ impl RouterServer {
                                         .await;
                                 }
 
+                                record_response_cache_state(
+                                    &resp_id,
+                                    prompt_cache_key.as_deref(),
+                                    &gemini_payload_for_cache,
+                                    &output_items,
+                                );
+
                                 let _ = tx
                                     .send(format_sse(
                                         Some("response.completed"),
@@ -1573,14 +1860,27 @@ impl RouterServer {
                                                 "output": output_items,
                                                 "usage": {
                                                     "input_tokens": tok_in,
+                                                    "input_tokens_details": {
+                                                        "cached_tokens": cached_tok,
+                                                        "cache_write_tokens": 0,
+                                                    },
                                                     "output_tokens": tok_out,
+                                                    "output_tokens_details": {
+                                                        "reasoning_tokens": reasoning_tok,
+                                                    },
                                                     "total_tokens": tok_in + tok_out,
                                                 }
                                             }
                                         }),
                                     ))
                                     .await;
-                                metrics.record_success(tok_in, tok_out);
+                                metrics.record_usage(
+                                    tok_in,
+                                    tok_out,
+                                    cached_tok,
+                                    reasoning_tok,
+                                    Some(req_started.elapsed().as_millis() as u64),
+                                );
                             });
                             RouterResponse::Sse(rx)
                         }
@@ -1760,18 +2060,34 @@ pub async fn serve(
     location: Option<String>,
 ) -> Result<()> {
     let server = Arc::new(RouterServer::new(project, location));
-    if server.metrics.get_default_model_override().is_none() {
-        if let Ok(state) = crate::ctl::load_state() {
-            if let Some(pm) = state.get("primary_model").and_then(|v| v.as_str()) {
-                if !pm.trim().is_empty() {
-                    server.metrics.set_default_model(pm.trim());
-                    server.metrics.set_hot_swap_active(true);
-                }
+    if let Ok(state) = crate::ctl::load_state() {
+        if let Some(arr) = state.get("available_models").and_then(|v| v.as_array()) {
+            let list: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if !list.is_empty() {
+                server.metrics.set_available_models(list);
             }
-            if let Some(re) = state.get("reasoning_effort").and_then(|v| v.as_str()) {
-                if !re.trim().is_empty() {
-                    server.metrics.set_reasoning_effort(re.trim());
-                }
+        }
+        if let Some(pm) = state.get("primary_model").and_then(|v| v.as_str()) {
+            if !pm.trim().is_empty() {
+                server.metrics.set_default_model(pm.trim());
+                server.metrics.set_hot_swap_active(true);
+            }
+        }
+        if let Some(fm) = state.get("fast_model").and_then(|v| v.as_str()) {
+            if !fm.trim().is_empty() {
+                server.metrics.set_fast_model(fm.trim());
+            }
+        }
+        if state.contains_key("fallback_model") {
+            let fb = state.get("fallback_model").and_then(|v| v.as_str());
+            server.metrics.set_fallback_model(fb);
+        }
+        if let Some(re) = state.get("reasoning_effort").and_then(|v| v.as_str()) {
+            if !re.trim().is_empty() {
+                server.metrics.set_reasoning_effort(re.trim());
             }
         }
     }

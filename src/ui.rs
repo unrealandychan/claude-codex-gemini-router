@@ -52,11 +52,11 @@ impl TrayVisualState {
 
     pub fn rgba_color(self) -> [u8; 4] {
         match self {
-            Self::Off => [0xcd, 0xd6, 0xf4, 0xff],          // #cdd6f4 (Catppuccin foreground)
+            Self::Off => [0xcd, 0xd6, 0xf4, 0xff], // #cdd6f4 (Catppuccin foreground)
             Self::SingleRouted => [0x89, 0xb4, 0xfa, 0xff], // #89b4fa (Catppuccin blue accent)
-            Self::BothRouted => [0xa6, 0xe3, 0xa1, 0xff],   // #a6e3a1 (Catppuccin green)
-            Self::Alert => [0xf3, 0x8b, 0xa8, 0xff],        // #f38ba8 (Catppuccin red)
-            Self::Busy => [0xf9, 0xe2, 0xaf, 0xff],         // #f9e2af (Catppuccin yellow)
+            Self::BothRouted => [0xa6, 0xe3, 0xa1, 0xff], // #a6e3a1 (Catppuccin green)
+            Self::Alert => [0xf3, 0x8b, 0xa8, 0xff], // #f38ba8 (Catppuccin red)
+            Self::Busy => [0xf9, 0xe2, 0xaf, 0xff], // #f9e2af (Catppuccin yellow)
         }
     }
 }
@@ -97,11 +97,7 @@ pub fn generate_tray_icon_rgba(state: TrayVisualState) -> (Vec<u8>, u32, u32) {
                 0
             };
             if dx * dx + dy * dy <= 25 {
-                let is_border = dx * dx + dy * dy >= 16
-                    || x == 2
-                    || x == 29
-                    || y == 2
-                    || y == 29;
+                let is_border = dx * dx + dy * dy >= 16 || x == 2 || x == 29 || y == 2 || y == 29;
                 if is_border {
                     set_px(x, y, fg);
                 } else {
@@ -226,7 +222,10 @@ pub fn format_tray_tooltip(status: &Map<String, Value>) -> String {
         .get("stats")
         .and_then(|v| v.as_object())
         .map(|s| {
-            let reqs = s.get("total_requests").and_then(|v| v.as_u64()).unwrap_or(0);
+            let reqs = s
+                .get("total_requests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let toks = s.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             (reqs, toks)
         })
@@ -840,6 +839,7 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     claudeRequests: 0,
     codexRequests: 0,
     totalTokens: 0,
+    cachedTokens: 0,
     lastLatencyMs: 0,
     isBusy: false,
     showLogsPanel: false,
@@ -913,6 +913,7 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
       state.claudeRequests = data.stats.claude_requests || 0;
       state.codexRequests = data.stats.codex_requests || 0;
       state.totalTokens = data.stats.total_tokens || 0;
+      state.cachedTokens = data.stats.cached_tokens || 0;
       state.lastLatencyMs = data.stats.last_latency_ms || 0;
     }
     renderState();
@@ -1033,6 +1034,7 @@ pub const CONTROL_PANEL_HTML: &str = r#"<!DOCTYPE html>
     if (state.totalRequests > 0) {
       let s = state.totalRequests + " reqs (C:" + state.claudeRequests + " X:" + state.codexRequests + ") · "
         + formatCompactNumber(state.totalTokens) + " tok";
+      if (state.cachedTokens > 0) s += " (" + formatCompactNumber(state.cachedTokens) + " cached)";
       if (state.lastLatencyMs > 0) s += " · " + state.lastLatencyMs + "ms";
       statsVal.textContent = s;
       statsVal.className = "info-val";

@@ -1,7 +1,7 @@
+use java_like_uuid::new_short_id;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
-use java_like_uuid::new_short_id;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
 pub const DEFAULT_FAST_GEMINI_MODEL: &str = "gemini-3-flash-preview";
@@ -42,7 +42,9 @@ impl ThoughtSignatureStore {
             if !id.is_empty() {
                 let mut store = self.store.lock().unwrap();
                 let mut order = self.order.lock().unwrap();
-                if !store.contains_key(id) && order.len() >= self.max_entries {
+                if store.contains_key(id) {
+                    order.retain(|k| k != id);
+                } else if order.len() >= self.max_entries {
                     if let Some(oldest) = order.pop_front() {
                         store.remove(&oldest);
                     }
@@ -55,8 +57,12 @@ impl ThoughtSignatureStore {
 
     pub fn get(&self, call_id: Option<&str>) -> Option<String> {
         if let Some(id) = call_id {
-            if let Some(sig) = self.store.lock().unwrap().get(id) {
-                return Some(sig.clone());
+            let found = self.store.lock().unwrap().get(id).cloned();
+            if let Some(sig) = found {
+                let mut order = self.order.lock().unwrap();
+                order.retain(|k| k != id);
+                order.push_back(id.to_string());
+                return Some(sig);
             }
         }
         self.last_signature.lock().unwrap().clone()
@@ -70,7 +76,418 @@ impl ThoughtSignatureStore {
 }
 
 pub static SIGNATURE_STORE: LazyLock<ThoughtSignatureStore> =
-    LazyLock::new(|| ThoughtSignatureStore::new(2048));
+    LazyLock::new(|| ThoughtSignatureStore::new(4096));
+
+pub struct ToolSchemaStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, Value>>,
+}
+
+impl ToolSchemaStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn save(&self, name: &str, declaration: &Value) {
+        if name.is_empty() {
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        let mut order = self.order.lock().unwrap();
+        if store.contains_key(name) {
+            order.retain(|k| k != name);
+        } else if order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        order.push_back(name.to_string());
+        store.insert(name.to_string(), declaration.clone());
+    }
+
+    pub fn get(&self, name: &str) -> Option<Value> {
+        let found = self.store.lock().unwrap().get(name).cloned();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != name);
+            order.push_back(name.to_string());
+        }
+        found
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static TOOL_SCHEMA_STORE: LazyLock<ToolSchemaStore> =
+    LazyLock::new(|| ToolSchemaStore::new(2048));
+
+#[derive(Clone, Debug)]
+pub struct CachedResponseState {
+    pub system_instruction: Option<Value>,
+    pub contents: Vec<Value>,
+    pub tools: Option<Value>,
+    pub call_id_to_name: HashMap<String, String>,
+}
+
+pub struct ResponseCacheStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, CachedResponseState>>,
+}
+
+impl ResponseCacheStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn save(&self, key: &str, state: CachedResponseState) {
+        if key.is_empty() {
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        let mut order = self.order.lock().unwrap();
+        if store.contains_key(key) {
+            order.retain(|k| k != key);
+        } else if order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        order.push_back(key.to_string());
+        store.insert(key.to_string(), state);
+    }
+
+    pub fn get(&self, key: &str) -> Option<CachedResponseState> {
+        let found = self.store.lock().unwrap().get(key).cloned();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != key);
+            order.push_back(key.to_string());
+        }
+        found
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static RESPONSE_CACHE_STORE: LazyLock<ResponseCacheStore> =
+    LazyLock::new(|| ResponseCacheStore::new(1024));
+
+#[derive(Clone, Debug, Default)]
+pub struct AnthropicCacheHint {
+    pub session_key: String,
+    pub has_cache_control: bool,
+    pub is_multi_turn: bool,
+    pub estimated_prefix_tokens: u64,
+    pub estimated_new_turn_tokens: u64,
+}
+
+pub struct PromptCacheStore {
+    max_entries: usize,
+    order: Mutex<VecDeque<String>>,
+    store: Mutex<HashMap<String, u64>>,
+}
+
+impl PromptCacheStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: Mutex::new(VecDeque::new()),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record(&self, key: &str, cached_tokens: u64) {
+        if key.is_empty() || cached_tokens == 0 {
+            return;
+        }
+        let mut order = self.order.lock().unwrap();
+        let mut store = self.store.lock().unwrap();
+        order.retain(|k| k != key);
+        if order.len() >= self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
+        order.push_back(key.to_string());
+        store.insert(key.to_string(), cached_tokens);
+    }
+
+    pub fn get(&self, key: &str) -> Option<u64> {
+        let found = self.store.lock().unwrap().get(key).copied();
+        if found.is_some() {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|k| k != key);
+            order.push_back(key.to_string());
+        }
+        found
+    }
+
+    pub fn clear(&self) {
+        self.order.lock().unwrap().clear();
+        self.store.lock().unwrap().clear();
+    }
+}
+
+pub static PROMPT_CACHE_STORE: LazyLock<PromptCacheStore> =
+    LazyLock::new(|| PromptCacheStore::new(512));
+
+pub fn extract_anthropic_cache_hint(body: &Value, gemini_payload: &Value) -> AnthropicCacheHint {
+    use std::hash::{Hash, Hasher};
+
+    let raw_body_str = serde_json::to_string(body).unwrap_or_default();
+    let has_cache_control = raw_body_str.contains("\"cache_control\"");
+    let messages_len = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let is_multi_turn = messages_len > 1;
+
+    let sys_str = gemini_payload
+        .get("systemInstruction")
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+    let tools_str = gemini_payload
+        .get("tools")
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+    let contents = gemini_payload
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first_turn_str = contents
+        .first()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sys_str.hash(&mut hasher);
+    tools_str.hash(&mut hasher);
+    if sys_str.is_empty() && tools_str.is_empty() {
+        first_turn_str.hash(&mut hasher);
+    }
+    let session_key = format!("claude_cache_{:016x}", hasher.finish());
+
+    let mut prefix_bytes = sys_str.len() + tools_str.len();
+    if contents.len() > 1 {
+        for item in &contents[..contents.len() - 1] {
+            if let Ok(s) = serde_json::to_string(item) {
+                prefix_bytes += s.len();
+            }
+        }
+    }
+    let last_turn_bytes = contents
+        .last()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .map(|s| s.len())
+        .unwrap_or(4);
+
+    let estimated_prefix_tokens = (prefix_bytes as u64) / 4;
+    let estimated_new_turn_tokens = std::cmp::max(1, (last_turn_bytes as u64) / 4);
+
+    AnthropicCacheHint {
+        session_key,
+        has_cache_control,
+        is_multi_turn,
+        estimated_prefix_tokens,
+        estimated_new_turn_tokens,
+    }
+}
+
+pub fn resolve_effective_anthropic_cache_usage(
+    prompt_tokens: u64,
+    reported_cached_tokens: u64,
+    hint: Option<&AnthropicCacheHint>,
+) -> (u64, u64) {
+    let Some(h) = hint else {
+        let effective_cached = if prompt_tokens > 0 {
+            reported_cached_tokens.min(prompt_tokens)
+        } else {
+            reported_cached_tokens
+        };
+        return (
+            prompt_tokens.saturating_sub(effective_cached),
+            effective_cached,
+        );
+    };
+
+    let prev_cached = PROMPT_CACHE_STORE.get(&h.session_key).unwrap_or(0);
+    let should_preserve = prev_cached > 0
+        || reported_cached_tokens > 0
+        || (h.has_cache_control && h.estimated_prefix_tokens > 0)
+        || (h.is_multi_turn && h.estimated_prefix_tokens >= 64);
+
+    if !should_preserve {
+        return (prompt_tokens, 0);
+    }
+
+    if prompt_tokens > 0 {
+        let candidate = if prompt_tokens <= prev_cached {
+            // Conversation was compacted or truncated; scale down to current prompt size
+            reported_cached_tokens
+                .max(h.estimated_prefix_tokens)
+                .min(prompt_tokens.saturating_sub(1))
+        } else {
+            reported_cached_tokens
+                .max(prev_cached)
+                .max(h.estimated_prefix_tokens)
+                .min(prompt_tokens.saturating_sub(1))
+        };
+        if candidate > 0 {
+            PROMPT_CACHE_STORE.record(&h.session_key, candidate);
+        }
+        (prompt_tokens.saturating_sub(candidate), candidate)
+    } else {
+        // First SSE chunk (`message_start`) before Vertex AI reports `promptTokenCount`
+        let candidate = reported_cached_tokens
+            .max(prev_cached)
+            .max(h.estimated_prefix_tokens);
+        let uncached_in = if candidate > 0 {
+            h.estimated_new_turn_tokens.max(1)
+        } else {
+            0
+        };
+        (uncached_in, candidate)
+    }
+}
+
+pub fn extract_usage_counts(usage: &Value) -> (u64, u64, u64, u64) {
+    let prompt_tokens = usage
+        .get("promptTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("candidatesTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .get("cachedContentTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("thoughtsTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    (
+        prompt_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+    )
+}
+
+pub fn record_response_cache_state(
+    response_id: &str,
+    prompt_cache_key: Option<&str>,
+    gemini_payload: &Value,
+    output_or_parts: &[Value],
+) {
+    let sys_inst = gemini_payload.get("systemInstruction").cloned();
+    let tools = gemini_payload.get("tools").cloned();
+    let mut contents = gemini_payload
+        .get("contents")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut converted_parts: Vec<Value> = Vec::new();
+    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+    for item in output_or_parts {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if obj.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {
+                if let Some(carr) = obj.get("content").and_then(|c| c.as_array()) {
+                    for c in carr {
+                        if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                converted_parts.push(json!({"text": t}));
+                            }
+                        }
+                    }
+                } else if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
+                    if !s.is_empty() {
+                        converted_parts.push(json!({"text": s}));
+                    }
+                }
+            }
+            Some("function_call") => {
+                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                let call_id = obj
+                    .get("call_id")
+                    .or_else(|| obj.get("id"))
+                    .and_then(|v| v.as_str());
+                if let Some(cid) = call_id {
+                    call_id_to_name.insert(cid.to_string(), name.to_string());
+                }
+                let args = match obj.get("arguments") {
+                    Some(Value::String(s)) => {
+                        serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({"raw": s}))
+                    }
+                    Some(Value::Object(m)) => Value::Object(m.clone()),
+                    _ => json!({}),
+                };
+                let sig = obj
+                    .get("thought_signature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| SIGNATURE_STORE.get(call_id))
+                    .unwrap_or_else(|| SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string());
+                converted_parts.push(json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": args,
+                    },
+                    "thoughtSignature": sig,
+                }));
+            }
+            _ => {
+                if obj.contains_key("text") || obj.contains_key("functionCall") {
+                    converted_parts.push(item.clone());
+                }
+            }
+        }
+    }
+
+    if !converted_parts.is_empty() {
+        contents.push(json!({
+            "role": "model",
+            "parts": converted_parts,
+        }));
+    }
+
+    let state = CachedResponseState {
+        system_instruction: sys_inst,
+        contents,
+        tools,
+        call_id_to_name,
+    };
+    RESPONSE_CACHE_STORE.save(response_id, state.clone());
+    if let Some(cache_key) = prompt_cache_key.filter(|k| !k.trim().is_empty()) {
+        RESPONSE_CACHE_STORE.save(cache_key.trim(), state);
+    }
+}
 
 pub fn default_gemini_model() -> String {
     std::env::var("GEMINI_DEFAULT_MODEL")
@@ -188,10 +605,7 @@ pub fn format_model_display_name(model: &str) -> String {
         _ => {
             let mut parts: Vec<&str> = model.trim().split('-').collect();
             if parts.len() > 2
-                && parts
-                    .last()
-                    .map(|s| s.eq_ignore_ascii_case("preview"))
-                    == Some(true)
+                && parts.last().map(|s| s.eq_ignore_ascii_case("preview")) == Some(true)
             {
                 parts.pop();
             }
@@ -257,7 +671,10 @@ fn effort_to_thinking_level(effort: &str) -> &'static str {
     }
 }
 
-fn resolve_json_ref(ref_path: &str, root_schema: &Map<String, Value>) -> Option<Map<String, Value>> {
+fn resolve_json_ref(
+    ref_path: &str,
+    root_schema: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
     if !ref_path.starts_with("#/") {
         return None;
     }
@@ -399,10 +816,18 @@ fn sanitize_schema_inner(
     .into_iter()
     .collect();
 
-    let supported_formats: HashSet<&str> =
-        ["enum", "date-time", "date", "time", "int32", "int64", "float", "double"]
-            .into_iter()
-            .collect();
+    let supported_formats: HashSet<&str> = [
+        "enum",
+        "date-time",
+        "date",
+        "time",
+        "int32",
+        "int64",
+        "float",
+        "double",
+    ]
+    .into_iter()
+    .collect();
 
     let mut cleaned = Map::new();
 
@@ -754,10 +1179,15 @@ fn ensure_historical_tools_declared(
     contents: &[Value],
     mut fn_declarations: Vec<Value>,
 ) -> Vec<Value> {
-    let mut declared_names: HashSet<String> = fn_declarations
-        .iter()
-        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-        .collect();
+    let mut declared_names: HashSet<String> = HashSet::new();
+    for d in &fn_declarations {
+        if let Some(name) = d.get("name").and_then(|n| n.as_str()) {
+            if !name.is_empty() {
+                declared_names.insert(name.to_string());
+                TOOL_SCHEMA_STORE.save(name, d);
+            }
+        }
+    }
 
     for msg in contents {
         if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
@@ -767,11 +1197,14 @@ fn ensure_historical_tools_declared(
                         if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
                             if !name.is_empty() && !declared_names.contains(name) {
                                 declared_names.insert(name.to_string());
-                                fn_declarations.push(json!({
-                                    "name": name,
-                                    "description": format!("Tool {}", name),
-                                    "parameters": {"type": "object", "properties": {}},
-                                }));
+                                let decl = TOOL_SCHEMA_STORE.get(name).unwrap_or_else(|| {
+                                    json!({
+                                        "name": name,
+                                        "description": format!("Tool {}", name),
+                                        "parameters": {"type": "object", "properties": {}},
+                                    })
+                                });
+                                fn_declarations.push(decl);
                             }
                         }
                     }
@@ -844,10 +1277,7 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
             }
         }
         if !sys_parts.is_empty() {
-            payload.insert(
-                "systemInstruction".to_string(),
-                json!({"parts": sys_parts}),
-            );
+            payload.insert("systemInstruction".to_string(), json!({"parts": sys_parts}));
         }
     }
 
@@ -1031,7 +1461,10 @@ pub fn anthropic_to_gemini_request(body: &Value) -> (String, Value) {
     }
 
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -1231,6 +1664,14 @@ pub fn build_safeguard_results(tool_use_ids: &[String]) -> Value {
 }
 
 pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) -> Value {
+    gemini_to_anthropic_response_with_hint(gemini_resp, requested_model, None)
+}
+
+pub fn gemini_to_anthropic_response_with_hint(
+    gemini_resp: &Value,
+    requested_model: &str,
+    cache_hint: Option<&AnthropicCacheHint>,
+) -> Value {
     let (parts, finish_reason, usage) = extract_candidate_parts(gemini_resp);
     let mut content_blocks: Vec<Value> = Vec::new();
     let mut tool_use_ids: Vec<String> = Vec::new();
@@ -1295,14 +1736,10 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
         }
     };
 
-    let input_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (prompt_tokens, output_tokens, cached_tokens, _reasoning_tokens) =
+        extract_usage_counts(&usage);
+    let (uncached_input_tokens, effective_cached_tokens) =
+        resolve_effective_anthropic_cache_usage(prompt_tokens, cached_tokens, cache_hint);
 
     json!({
         "id": format!("msg_{}", new_short_id(24)),
@@ -1314,10 +1751,14 @@ pub fn gemini_to_anthropic_response(gemini_resp: &Value, requested_model: &str) 
         "stop_sequence": Value::Null,
         "safeguard_results": build_safeguard_results(&tool_use_ids),
         "usage": {
-            "input_tokens": input_tokens,
+            "input_tokens": uncached_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()).unwrap_or(0),
+            "cache_read_input_tokens": effective_cached_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0,
+            }
         }
     })
 }
@@ -1355,24 +1796,42 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
         let content = msg.get("content");
 
         if role == "system" || role == "developer" {
+            let mut extracted = Vec::new();
             if let Some(s) = content.and_then(|c| c.as_str()) {
                 if !s.is_empty() {
-                    sys_parts.push(json!({"text": s}));
+                    extracted.push(json!({"text": s}));
                 }
             } else if let Some(arr) = content.and_then(|c| c.as_array()) {
                 for item in arr {
                     if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
                         if !t.is_empty() {
-                            sys_parts.push(json!({"text": t}));
+                            extracted.push(json!({"text": t}));
                         }
                     }
+                }
+            }
+            if !extracted.is_empty() {
+                if raw_contents.is_empty() {
+                    // Leading system/developer messages form the static systemInstruction prefix
+                    sys_parts.extend(extracted);
+                } else {
+                    // Mid-conversation system/developer messages stay in-place as user turns
+                    // so `systemInstruction` at the start of the prompt never mutates and
+                    // invalidates Vertex AI's context cache prefix.
+                    raw_contents.push(json!({
+                        "role": "user",
+                        "parts": extracted,
+                    }));
                 }
             }
             continue;
         }
 
         if role == "tool" {
-            let call_id = msg.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let fn_name = msg
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -1463,21 +1922,23 @@ pub fn openai_chat_to_gemini_request(body: &Value) -> (String, Value) {
     }
 
     if !sys_parts.is_empty() {
-        payload.insert(
-            "systemInstruction".to_string(),
-            json!({"parts": sys_parts}),
-        );
+        payload.insert("systemInstruction".to_string(), json!({"parts": sys_parts}));
     }
 
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         for tool in tools {
             if let Some(tobj) = tool.as_object() {
                 let fn_def = if tobj.get("type").and_then(|t| t.as_str()) == Some("function") {
-                    tobj.get("function").and_then(|f| f.as_object()).unwrap_or(tobj)
+                    tobj.get("function")
+                        .and_then(|f| f.as_object())
+                        .unwrap_or(tobj)
                 } else {
                     tobj
                 };
@@ -1588,10 +2049,9 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
             if let Some(ref s) = sig {
                 SIGNATURE_STORE.save(Some(&call_id), Some(s));
             }
-            let args_str = serde_json::to_string(
-                &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-            )
-            .unwrap_or_else(|_| "{}".to_string());
+            let args_str =
+                serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                    .unwrap_or_else(|_| "{}".to_string());
             tool_calls.push(json!({
                 "id": call_id,
                 "type": "function",
@@ -1608,10 +2068,7 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
     let mut message = Map::new();
     message.insert("role".to_string(), Value::String("assistant".to_string()));
     if !text_chunks.is_empty() || tool_calls.is_empty() {
-        message.insert(
-            "content".to_string(),
-            Value::String(text_chunks.join("")),
-        );
+        message.insert("content".to_string(), Value::String(text_chunks.join("")));
     } else {
         message.insert("content".to_string(), Value::Null);
     }
@@ -1627,14 +2084,8 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
         "stop"
     };
 
-    let prompt_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens) =
+        extract_usage_counts(&usage);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1652,7 +2103,13 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_tokens,
+            },
             "completion_tokens": completion_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
@@ -1661,6 +2118,18 @@ pub fn gemini_to_openai_chat_response(gemini_resp: &Value, requested_model: &str
 pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     let model = resolve_gemini_model(body.get("model").and_then(|v| v.as_str()));
     let mut payload = Map::new();
+
+    let prev_state = body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|id| RESPONSE_CACHE_STORE.get(id.trim()))
+        .or_else(|| {
+            body.get("prompt_cache_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|k| RESPONSE_CACHE_STORE.get(k.trim()))
+        });
 
     if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
         if !instructions.trim().is_empty() {
@@ -1674,6 +2143,10 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
     let input_data = body.get("input");
     let mut raw_contents: Vec<Value> = Vec::new();
     let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+
+    if let Some(ref ps) = prev_state {
+        call_id_to_name.extend(ps.call_id_to_name.clone());
+    }
 
     if let Some(s) = input_data.and_then(|v| v.as_str()) {
         raw_contents.push(json!({
@@ -1708,7 +2181,10 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 Some(o) => o,
                 None => continue,
             };
-            let item_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("message");
+            let item_type = obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("message");
             if item_type == "function_call" {
                 let raw_args = obj.get("arguments");
                 let args = match raw_args {
@@ -1765,22 +2241,38 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 if role == "system" || role == "developer" {
                     let mut sys_texts: Vec<String> = Vec::new();
                     if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
-                        sys_texts.push(s.to_string());
+                        if !s.is_empty() {
+                            sys_texts.push(s.to_string());
+                        }
                     } else if let Some(carr) = obj.get("content").and_then(|c| c.as_array()) {
                         for c in carr {
                             if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                                sys_texts.push(t.to_string());
+                                if !t.is_empty() {
+                                    sys_texts.push(t.to_string());
+                                }
                             }
                         }
                     }
                     if !sys_texts.is_empty() {
-                        let existing = payload
-                            .entry("systemInstruction".to_string())
-                            .or_insert_with(|| json!({"parts": []}));
-                        if let Some(parts_arr) =
-                            existing.get_mut("parts").and_then(|p| p.as_array_mut())
-                        {
-                            parts_arr.push(json!({"text": sys_texts.join("\n")}));
+                        let joined = sys_texts.join("\n");
+                        if raw_contents.is_empty() {
+                            // Leading developer/system items belong in the static systemInstruction prefix
+                            let existing = payload
+                                .entry("systemInstruction".to_string())
+                                .or_insert_with(|| json!({"parts": []}));
+                            if let Some(parts_arr) =
+                                existing.get_mut("parts").and_then(|p| p.as_array_mut())
+                            {
+                                parts_arr.push(json!({"text": joined}));
+                            }
+                        } else {
+                            // Mid-conversation developer/system items stay in-place as user turns
+                            // so `systemInstruction` at the root of the request never mutates and
+                            // invalidates Vertex AI's context cache prefix.
+                            raw_contents.push(json!({
+                                "role": "user",
+                                "parts": [{"text": joined}],
+                            }));
                         }
                     }
                     continue;
@@ -1819,8 +2311,36 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
         }
     }
 
+    if let Some(ref ps) = prev_state {
+        if !payload.contains_key("systemInstruction") {
+            if let Some(ref sys) = ps.system_instruction {
+                payload.insert("systemInstruction".to_string(), sys.clone());
+            }
+        }
+        // If `previous_response_id` was explicitly passed and `raw_contents` only contains
+        // incremental delta items (does not already start with the cached first turn),
+        // prepend the cached conversation prefix so Vertex AI hits its prefix cache.
+        if body
+            .get("previous_response_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+            && !ps.contents.is_empty()
+        {
+            let already_has_prefix = raw_contents.first() == ps.contents.first()
+                && raw_contents.len() > ps.contents.len();
+            if !already_has_prefix {
+                let mut combined = ps.contents.clone();
+                combined.extend(raw_contents);
+                raw_contents = combined;
+            }
+        }
+    }
+
     let normalized_contents = normalize_gemini_contents(raw_contents);
-    payload.insert("contents".to_string(), Value::Array(normalized_contents.clone()));
+    payload.insert(
+        "contents".to_string(),
+        Value::Array(normalized_contents.clone()),
+    );
 
     let mut fn_declarations: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -1829,7 +2349,9 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                 let fn_def = if tobj.get("type").and_then(|t| t.as_str()) == Some("function")
                     && tobj.contains_key("function")
                 {
-                    tobj.get("function").and_then(|f| f.as_object()).unwrap_or(tobj)
+                    tobj.get("function")
+                        .and_then(|f| f.as_object())
+                        .unwrap_or(tobj)
                 } else {
                     tobj
                 };
@@ -1847,6 +2369,17 @@ pub fn openai_responses_to_gemini_request(body: &Value) -> (String, Value) {
                     }
                 }
             }
+        }
+    } else if let Some(ref ps) = prev_state {
+        if let Some(cached_decls) = ps
+            .tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("functionDeclarations"))
+            .and_then(|fd| fd.as_array())
+        {
+            fn_declarations = cached_decls.clone();
         }
     }
 
@@ -1928,10 +2461,9 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
             if let Some(ref s) = sig {
                 SIGNATURE_STORE.save(Some(&call_id), Some(s));
             }
-            let args_str = serde_json::to_string(
-                &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-            )
-            .unwrap_or_else(|_| "{}".to_string());
+            let args_str =
+                serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                    .unwrap_or_else(|_| "{}".to_string());
             output_items.push(json!({
                 "id": format!("fc_{}", new_short_id(24)),
                 "type": "function_call",
@@ -1962,14 +2494,8 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
         );
     }
 
-    let input_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (input_tokens, output_tokens, cached_tokens, reasoning_tokens) =
+        extract_usage_counts(&usage);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1984,7 +2510,14 @@ pub fn gemini_to_openai_responses(gemini_resp: &Value, requested_model: &str) ->
         "output": output_items,
         "usage": {
             "input_tokens": input_tokens,
+            "input_tokens_details": {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": 0,
+            },
             "output_tokens": output_tokens,
+            "output_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
             "total_tokens": input_tokens + output_tokens,
         }
     })
@@ -2009,6 +2542,9 @@ pub struct AnthropicStreamState {
     pub tool_use_ids: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_hint: Option<AnthropicCacheHint>,
 }
 
 impl AnthropicStreamState {
@@ -2023,13 +2559,49 @@ impl AnthropicStreamState {
             tool_use_ids: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            cache_hint: None,
         }
+    }
+
+    pub fn with_cache_hint(requested_model: &str, cache_hint: AnthropicCacheHint) -> Self {
+        let mut s = Self::new(requested_model);
+        s.cache_hint = Some(cache_hint);
+        s
     }
 
     pub fn process_gemini_chunk(&mut self, chunk: &Value) -> Vec<String> {
         let mut out = Vec::new();
+        let (parts, _finish_reason, usage) = extract_candidate_parts(chunk);
+        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            self.input_tokens = pt;
+        }
+        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+            self.output_tokens = ct;
+        }
+        if let Some(cached) = usage
+            .get("cachedContentTokenCount")
+            .and_then(|v| v.as_u64())
+        {
+            if cached > 0 {
+                self.cached_tokens = cached;
+            }
+        }
+        if let Some(thoughts) = usage.get("thoughtsTokenCount").and_then(|v| v.as_u64()) {
+            self.reasoning_tokens = thoughts;
+        }
+
         if !self.started {
             self.started = true;
+            let (uncached_in, effective_cached) = resolve_effective_anthropic_cache_usage(
+                self.input_tokens,
+                self.cached_tokens,
+                self.cache_hint.as_ref(),
+            );
+            if effective_cached > self.cached_tokens {
+                self.cached_tokens = effective_cached;
+            }
             out.push(format_sse(
                 Some("message_start"),
                 &json!({
@@ -2042,18 +2614,19 @@ impl AnthropicStreamState {
                         "content": [],
                         "stop_reason": Value::Null,
                         "stop_sequence": Value::Null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": {
+                            "input_tokens": uncached_in,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": effective_cached,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 0,
+                                "ephemeral_1h_input_tokens": 0,
+                            }
+                        },
                     }
                 }),
             ));
-        }
-
-        let (parts, _finish_reason, usage) = extract_candidate_parts(chunk);
-        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
-            self.input_tokens = pt;
-        }
-        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
-            self.output_tokens = ct;
         }
 
         for part in parts {
@@ -2124,10 +2697,9 @@ impl AnthropicStreamState {
                     SIGNATURE_STORE.save(Some(&call_id), Some(s));
                 }
                 self.tool_use_ids.push(call_id.clone());
-                let args_json = serde_json::to_string(
-                    &fc.get("args").cloned().unwrap_or_else(|| json!({})),
-                )
-                .unwrap_or_else(|_| "{}".to_string());
+                let args_json =
+                    serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                        .unwrap_or_else(|_| "{}".to_string());
 
                 out.push(format_sse(
                     Some("content_block_start"),
@@ -2210,6 +2782,12 @@ impl AnthropicStreamState {
         } else {
             "end_turn"
         };
+        let (uncached_in, effective_cached) = resolve_effective_anthropic_cache_usage(
+            self.input_tokens,
+            self.cached_tokens,
+            self.cache_hint.as_ref(),
+        );
+        self.cached_tokens = effective_cached;
         out.push(format_sse(
             Some("message_delta"),
             &json!({
@@ -2219,7 +2797,16 @@ impl AnthropicStreamState {
                     "stop_sequence": Value::Null,
                     "safeguard_results": build_safeguard_results(&self.tool_use_ids),
                 },
-                "usage": {"output_tokens": self.output_tokens},
+                "usage": {
+                    "input_tokens": uncached_in,
+                    "output_tokens": self.output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": effective_cached,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0,
+                    }
+                },
             }),
         ));
         out.push(format_sse(

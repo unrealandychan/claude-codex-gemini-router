@@ -448,24 +448,22 @@ fn main() {
                 let _ = tray_icon.set_tooltip(Some(tooltip));
             }
 
-            Event::UserEvent(UserEvent::TrayIcon(tray_event)) => {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    rect,
-                    position,
-                    ..
-                } = tray_event
-                {
-                    if window.is_visible() {
-                        window.set_visible(false);
-                    } else {
-                        position_popover_near_tray(&window, Some(rect), Some(position));
-                        window.set_visible(true);
-                        window.set_focus();
-                    }
+            Event::UserEvent(UserEvent::TrayIcon(TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                rect,
+                position,
+                ..
+            })) => {
+                if window.is_visible() {
+                    window.set_visible(false);
+                } else {
+                    position_popover_near_tray(&window, Some(rect), Some(position));
+                    window.set_visible(true);
+                    window.set_focus();
                 }
             }
+            Event::UserEvent(UserEvent::TrayIcon(_)) => {}
 
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 if menu_event.id == id_toggle_panel {
@@ -517,9 +515,8 @@ fn main() {
                                 None,
                             );
                         } else if menu_id == id_flip {
-                            let _ = ctl::cmd_set_model(
-                                None, None, true, None, None, None, None, None,
-                            );
+                            let _ =
+                                ctl::cmd_set_model(None, None, true, None, None, None, None, None);
                         } else if menu_id == id_restart {
                             let _ = ctl::cmd_restart_router();
                         } else if menu_id == id_login {

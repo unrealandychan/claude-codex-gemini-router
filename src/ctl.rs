@@ -24,6 +24,8 @@ pub const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 const CODEX_BLOCK_BEGIN: &str = "# BEGIN OMARCHY_GEMINI_ADC_ROUTER";
 const CODEX_BLOCK_END: &str = "# END OMARCHY_GEMINI_ADC_ROUTER";
+const MENU_BLOCK_BEGIN: &str = "  // gemini-router-menu-start";
+const MENU_BLOCK_END: &str = "  // gemini-router-menu-end";
 
 const CLAUDE_MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -34,6 +36,9 @@ const CLAUDE_MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "DISABLE_PROMPT_CACHING",
+    "DISABLE_PROMPT_CACHING_HAIKU",
+    "DISABLE_PROMPT_CACHING_SONNET",
+    "DISABLE_PROMPT_CACHING_OPUS",
 ];
 
 pub struct Paths {
@@ -43,6 +48,7 @@ pub struct Paths {
     pub pid_file: PathBuf,
     pub claude_settings: PathBuf,
     pub codex_config: PathBuf,
+    pub menu_config: PathBuf,
     pub project_dir: PathBuf,
 }
 
@@ -70,6 +76,14 @@ pub fn get_paths() -> Paths {
     let codex_config = env::var("CODEX_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home.join(".codex").join("config.toml"));
+    let menu_config = env::var("OMARCHY_MENU_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            home.join(".config")
+                .join("omarchy")
+                .join("extensions")
+                .join("omarchy-menu.jsonc")
+        });
 
     let mut default_project_dir = home.join("Projects").join("claude-codex-gemini-router");
     if !default_project_dir.join("Cargo.toml").is_file() {
@@ -100,6 +114,7 @@ pub fn get_paths() -> Paths {
         config_dir,
         claude_settings,
         codex_config,
+        menu_config,
         project_dir,
     }
 }
@@ -231,10 +246,7 @@ pub fn write_file_safely(path: &Path, content: &str, mode: u32) -> Result<(), St
         }
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp_name = format!(
         ".{}.tmp.{}.{}",
         file_name,
@@ -286,8 +298,14 @@ fn enriched_path_env() -> String {
     let current_path = env::var("PATH").unwrap_or_default();
     if cfg!(windows) {
         let mut parts = vec![
-            home.join(".cargo").join("bin").to_string_lossy().into_owned(),
-            home.join(".local").join("bin").to_string_lossy().into_owned(),
+            home.join(".cargo")
+                .join("bin")
+                .to_string_lossy()
+                .into_owned(),
+            home.join(".local")
+                .join("bin")
+                .to_string_lossy()
+                .into_owned(),
             home.join("google-cloud-sdk")
                 .join("bin")
                 .to_string_lossy()
@@ -462,6 +480,15 @@ pub fn load_state() -> Result<Map<String, Value>, String> {
                 default_state.insert(k, v);
             }
         }
+    }
+    if !is_mock_daemon() {
+        default_state.remove("mock_router_running");
+    }
+    if let Some(Value::Object(b)) = default_state.get_mut("claude_backup_env") {
+        b.remove("DISABLE_PROMPT_CACHING");
+        b.remove("DISABLE_PROMPT_CACHING_HAIKU");
+        b.remove("DISABLE_PROMPT_CACHING_SONNET");
+        b.remove("DISABLE_PROMPT_CACHING_OPUS");
     }
     let avail = get_state_available_models(&default_state);
     default_state.insert(
@@ -736,10 +763,13 @@ pub fn configure_claude_routing(
             "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
             Value::String(primary_model.to_string()),
         );
-        base_env.insert(
-            "DISABLE_PROMPT_CACHING".to_string(),
-            Value::String("1".to_string()),
-        );
+        // Keep prompt caching enabled so Claude Code sends normal cache_control
+        // markers and the router reports Vertex AI cachedContentTokenCount back
+        // as cache_read_input_tokens.
+        base_env.remove("DISABLE_PROMPT_CACHING");
+        base_env.remove("DISABLE_PROMPT_CACHING_HAIKU");
+        base_env.remove("DISABLE_PROMPT_CACHING_SONNET");
+        base_env.remove("DISABLE_PROMPT_CACHING_OPUS");
 
         let effort_level = state
             .get("reasoning_effort")
@@ -797,9 +827,8 @@ pub fn configure_claude_routing(
         }
     }
 
-    let out = serde_json::to_string_pretty(&Value::Object(settings))
-        .map_err(|e| e.to_string())?
-        + "\n";
+    let out =
+        serde_json::to_string_pretty(&Value::Object(settings)).map_err(|e| e.to_string())? + "\n";
     write_file_safely(&paths.claude_settings, &out, 0o600)
 }
 
@@ -1147,8 +1176,20 @@ fn find_router_binary(paths: &Paths) -> Option<PathBuf> {
         }
     }
     candidates.push(home.join(".local").join("bin").join(bin_name));
-    candidates.push(paths.project_dir.join("target").join("release").join(bin_name));
-    candidates.push(paths.project_dir.join("target").join("debug").join(bin_name));
+    candidates.push(
+        paths
+            .project_dir
+            .join("target")
+            .join("release")
+            .join(bin_name),
+    );
+    candidates.push(
+        paths
+            .project_dir
+            .join("target")
+            .join("debug")
+            .join(bin_name),
+    );
 
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -1230,10 +1271,7 @@ pub fn start_router_daemon(state: &Map<String, Value>) -> (bool, String) {
 
     let paths = get_paths();
     let Some(router_bin) = find_router_binary(&paths) else {
-        return (
-            false,
-            "claude-gemini-router binary not found".to_string(),
-        );
+        return (false, "claude-gemini-router binary not found".to_string());
     };
 
     let _ = fs::create_dir_all(&paths.config_dir);
@@ -1437,8 +1475,156 @@ pub fn which_in_path(binary: &str) -> bool {
     resolve_binary_in_path(binary).is_some()
 }
 
+pub fn send_desktop_notification(summary: &str, body: &str, urgency: &str) {
+    if env::var("OMARCHY_GEMINI_ROUTER_NO_NOTIFY").as_deref() == Ok("1") {
+        return;
+    }
+    if let Some(bin) = resolve_binary_in_path("omarchy-notification-send") {
+        let _ = Command::new(bin)
+            .args([
+                "--app-name",
+                "Gemini ADC Router",
+                "--urgency",
+                urgency,
+                "--",
+                summary,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    } else if let Some(bin) = resolve_binary_in_path("notify-send") {
+        let _ = Command::new(bin)
+            .args([
+                "-a",
+                "Gemini ADC Router",
+                "-u",
+                urgency,
+                "--",
+                summary,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+pub fn strip_menu_managed_block(raw: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in raw.lines() {
+        if line.trim() == MENU_BLOCK_BEGIN.trim() {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line.trim() == MENU_BLOCK_END.trim() {
+                in_block = false;
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    let mut joined = out.join("\n");
+    if raw.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+pub fn is_menu_enabled() -> Result<bool, String> {
+    let paths = get_paths();
+    let Some(raw) = read_file_safely(&paths.menu_config)? else {
+        return Ok(false);
+    };
+    Ok(raw.contains(MENU_BLOCK_BEGIN) && raw.contains(r#""trigger.gemini-router""#))
+}
+
+fn has_jsonc_entries_after_brace(raw: &str, open_brace_idx: usize) -> bool {
+    let rest = &raw[open_brace_idx + 1..];
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn configure_menu_entry(enable: bool) -> Result<bool, String> {
+    let paths = get_paths();
+    let raw = read_file_safely(&paths.menu_config)?.unwrap_or_else(|| "{\n}\n".to_string());
+    let cleaned = strip_menu_managed_block(&raw);
+    if !enable {
+        if raw != cleaned || paths.menu_config.is_file() {
+            write_file_safely(&paths.menu_config, &cleaned, 0o600)?;
+        }
+        return Ok(false);
+    }
+
+    let open_brace_idx = cleaned
+        .find('{')
+        .ok_or_else(|| "Invalid omarchy-menu.jsonc: missing opening '{'".to_string())?;
+    let has_following = has_jsonc_entries_after_brace(&cleaned, open_brace_idx);
+    let trailing_comma = if has_following { "," } else { "" };
+
+    let entries = [
+        MENU_BLOCK_BEGIN.to_string(),
+        r#"  "trigger.gemini-router": {"icon": "󰚩", "label": "Gemini ADC Router", "description": "Route Claude Code & OpenAI Codex to Vertex AI Gemini", "aliases": ["gemini", "router", "adc", "vertex"]},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-both": {"icon": "󰚩", "label": "Toggle Both (Claude + Codex)", "aliases": ["gemini-toggle"], "action": "omarchy-gemini-router-ctl toggle --target both --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-claude": {"icon": "󰚩", "label": "Toggle Claude Code Routing", "action": "omarchy-gemini-router-ctl toggle --target claude --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.toggle-codex": {"icon": "󰚩", "label": "Toggle OpenAI Codex Routing", "action": "omarchy-gemini-router-ctl toggle --target codex --notify"},"#.to_string(),
+        r#"  "trigger.gemini-router.flip-model": {"icon": "󰁯", "label": "Switch Active Gemini Model", "aliases": ["gemini-model"], "action": "omarchy-gemini-router-ctl set-model --flip --notify"},"#.to_string(),
+        format!(
+            r#"  "trigger.gemini-router.adc-login": {{"icon": "󰌋", "label": "Reset Vertex AI ADC Credentials", "action": "omarchy-gemini-router-ctl adc-login --notify"}}{}"#,
+            trailing_comma
+        ),
+        MENU_BLOCK_END.to_string(),
+    ]
+    .join("\n");
+
+    let mut updated = String::with_capacity(cleaned.len() + entries.len() + 4);
+    updated.push_str(&cleaned[..=open_brace_idx]);
+    updated.push('\n');
+    updated.push_str(&entries);
+    if !cleaned[open_brace_idx + 1..].starts_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&cleaned[open_brace_idx + 1..]);
+    write_file_safely(&paths.menu_config, &updated, 0o600)?;
+    Ok(true)
+}
+
+pub fn cmd_menu(action: &str) -> Result<Map<String, Value>, String> {
+    let enabled = match action {
+        "enable" => configure_menu_entry(true)?,
+        "disable" => configure_menu_entry(false)?,
+        "toggle" => {
+            let cur = is_menu_enabled()?;
+            configure_menu_entry(!cur)?
+        }
+        "status" => is_menu_enabled()?,
+        other => {
+            return Err(format!(
+                "Invalid menu action '{}'. Use --enable, --disable, --toggle, or --status",
+                other
+            ))
+        }
+    };
+    let mut res = build_status_dict()?;
+    res.insert("menu_enabled".to_string(), Value::Bool(enabled));
+    Ok(res)
+}
+
 pub fn build_status_dict() -> Result<Map<String, Value>, String> {
-    let state = load_state()?;
+    let mut state = load_state()?;
     let health = if is_mock_daemon() {
         None
     } else {
@@ -1493,22 +1679,28 @@ pub fn build_status_dict() -> Result<Map<String, Value>, String> {
     let (adc_info, primary_model, reasoning_effort, hot_swap_active, stats_info) =
         if let Some(ref h) = health {
             if let Some(adc_obj) = h.get("adc").filter(|v| v.is_object()) {
-                let pm = h
+                let mut pm = h
                     .get("primary_model")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&state_primary)
                     .to_string();
-                let re = h
+                let mut re = h
                     .get("reasoning_effort")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&state_effort)
                     .to_string();
-                let hs = h
+                let mut hs = h
                     .get("hot_swap_active")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if !hs || pm != state_primary || re != state_effort {
+                    push_router_config(&state, true);
+                    pm = state_primary;
+                    re = state_effort;
+                    hs = true;
+                }
                 if let Some(Value::Object(raw_stats)) = h.get("stats") {
                     for (k, v) in raw_stats {
                         default_stats.insert(k.clone(), v.clone());
@@ -1536,6 +1728,31 @@ pub fn build_status_dict() -> Result<Map<String, Value>, String> {
 
     let claude_on = is_claude_routed()?;
     let codex_on = is_codex_routed()?;
+
+    if claude_on {
+        let settings = read_file_safely(&get_paths().claude_settings)
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .unwrap_or_else(|| json!({}));
+        let needs_claude_heal = settings.get("model").and_then(|v| v.as_str())
+            != Some(primary_model.as_str())
+            || settings
+                .get("env")
+                .and_then(|v| v.as_object())
+                .is_some_and(|env| {
+                    env.contains_key("DISABLE_PROMPT_CACHING")
+                        || env.contains_key("DISABLE_PROMPT_CACHING_HAIKU")
+                        || env.contains_key("DISABLE_PROMPT_CACHING_SONNET")
+                        || env.contains_key("DISABLE_PROMPT_CACHING_OPUS")
+                        || env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str())
+                            != Some(primary_model.as_str())
+                });
+        if needs_claude_heal {
+            let _ = configure_claude_routing(true, &primary_model, &mut state);
+            let _ = save_state(&state);
+        }
+    }
 
     let mut available_models = get_state_available_models(&state);
     if !available_models.contains(&primary_model) {
@@ -1580,6 +1797,7 @@ pub fn build_status_dict() -> Result<Map<String, Value>, String> {
         .unwrap_or("gemini-3.8-flash")
         .to_string();
     let fallback_model = state.get("fallback_model").cloned().unwrap_or(Value::Null);
+    let menu_enabled = is_menu_enabled().unwrap_or(false);
 
     let val = json!({
         "ok": true,
@@ -1594,6 +1812,7 @@ pub fn build_status_dict() -> Result<Map<String, Value>, String> {
         "both_enabled": claude_on && codex_on,
         "claude_installed": which_in_path("claude"),
         "codex_installed": which_in_path("codex"),
+        "menu_enabled": menu_enabled,
         "primary_model": primary_model,
         "primary_model_display": format_model_display_name(&primary_model),
         "primary_model_short": short_model,
@@ -1726,6 +1945,7 @@ pub fn cmd_toggle(target: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_set_model(
     model_arg: Option<&str>,
     effort_arg: Option<&str>,
@@ -2001,7 +2221,14 @@ pub fn cmd_adc_login() -> Result<Map<String, Value>, String> {
                 .is_ok()
         } else {
             Command::new("cmd.exe")
-                .args(["/C", "start", "powershell.exe", "-NoExit", "-Command", &ps_cmd])
+                .args([
+                    "/C",
+                    "start",
+                    "powershell.exe",
+                    "-NoExit",
+                    "-Command",
+                    &ps_cmd,
+                ])
                 .spawn()
                 .is_ok()
         };
@@ -2117,10 +2344,27 @@ pub fn dispatch_args(args: &[String]) -> Result<Map<String, Value>, String> {
     let mut fast_model: Option<String> = None;
     let mut fallback_model: Option<String> = None;
     let mut lines: usize = 40;
+    let mut notify = false;
+    let mut menu_action = "status".to_string();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--notify" => {
+                notify = true;
+            }
+            "--enable" => {
+                menu_action = "enable".to_string();
+            }
+            "--disable" => {
+                menu_action = "disable".to_string();
+            }
+            "--toggle" => {
+                menu_action = "toggle".to_string();
+            }
+            "--status" => {
+                menu_action = "status".to_string();
+            }
             "--target" => {
                 i += 1;
                 if i < args.len() {
@@ -2210,7 +2454,7 @@ pub fn dispatch_args(args: &[String]) -> Result<Map<String, Value>, String> {
         i += 1;
     }
 
-    match sub {
+    let res = match sub {
         "status" => build_status_dict(),
         "enable" => cmd_enable(&target, model.as_deref(), effort.as_deref()),
         "disable" => cmd_disable(&target),
@@ -2231,8 +2475,65 @@ pub fn dispatch_args(args: &[String]) -> Result<Map<String, Value>, String> {
         "logs" => cmd_logs(lines),
         "adc-login" => cmd_adc_login(),
         "refresh-auth" => cmd_refresh_auth(),
+        "menu" => cmd_menu(&menu_action),
         other => Err(format!("Unknown subcommand: '{}'", other)),
+    }?;
+
+    if notify {
+        let status_label = res
+            .get("status_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Updated");
+        let model_display = res
+            .get("primary_model_display")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Gemini");
+        let effort_s = res
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium");
+        match sub {
+            "enable" | "disable" | "toggle" => {
+                send_desktop_notification(
+                    status_label,
+                    &format!("Model: {} ({})", model_display, effort_s),
+                    "normal",
+                );
+            }
+            "set-model" => {
+                send_desktop_notification(
+                    &format!("Active Model: {}", model_display),
+                    &format!("{} · Effort: {}", status_label, effort_s),
+                    "normal",
+                );
+            }
+            "adc-login" => {
+                send_desktop_notification(
+                    "Vertex AI ADC Login",
+                    "Launched gcloud application-default login in terminal",
+                    "normal",
+                );
+            }
+            "menu" => {
+                let on = res
+                    .get("menu_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                send_desktop_notification(
+                    if on {
+                        "Omarchy Menu Enabled"
+                    } else {
+                        "Omarchy Menu Disabled"
+                    },
+                    "SUPER+SPACE -> Trigger -> Gemini ADC Router",
+                    "normal",
+                );
+            }
+            _ => {}
+        }
     }
+
+    Ok(res)
 }
 
 pub fn dispatch_json_action(body: &Value) -> Result<Map<String, Value>, String> {
@@ -2301,4 +2602,3 @@ pub fn run_cli() {
         }
     }
 }
-

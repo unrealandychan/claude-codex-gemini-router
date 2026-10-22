@@ -1,11 +1,13 @@
 use claude_codex_gemini_router::adc_auth::ADCAuthManager;
 use claude_codex_gemini_router::server::{RouterResponse, RouterServer};
 use claude_codex_gemini_router::translator::{
-    anthropic_to_gemini_request, format_model_display_name, format_model_short_badge,
-    format_model_short_label, gemini_to_anthropic_response, gemini_to_openai_chat_response,
+    anthropic_to_gemini_request, extract_anthropic_cache_hint, format_model_display_name,
+    format_model_short_badge, format_model_short_label, gemini_to_anthropic_response,
+    gemini_to_anthropic_response_with_hint, gemini_to_openai_chat_response,
     gemini_to_openai_responses, openai_chat_to_gemini_request, openai_responses_to_gemini_request,
-    resolve_gemini_model, sanitize_json_schema, AnthropicStreamState,
-    SKIP_THOUGHT_SIGNATURE_VALIDATOR, SIGNATURE_STORE,
+    record_response_cache_state, resolve_gemini_model, sanitize_json_schema, AnthropicStreamState,
+    PROMPT_CACHE_STORE, RESPONSE_CACHE_STORE, SIGNATURE_STORE, SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+    TOOL_SCHEMA_STORE,
 };
 use claude_codex_gemini_router::ui::{
     format_tray_tooltip, generate_tray_icon_rgba, TrayVisualState, CONTROL_PANEL_HTML,
@@ -155,9 +157,11 @@ fn test_anthropic_to_gemini_and_back() {
         gemini_payload["contents"][0]["parts"][0]["text"],
         "List files in current directory"
     );
-    assert!(gemini_payload["tools"][0]["functionDeclarations"][0]["parameters"]
-        .get("additionalProperties")
-        .is_none());
+    assert!(
+        gemini_payload["tools"][0]["functionDeclarations"][0]["parameters"]
+            .get("additionalProperties")
+            .is_none()
+    );
 
     let fake_gemini_resp = json!({
         "candidates": [
@@ -472,10 +476,7 @@ fn test_anthropic_stream_function_call_preserves_signature() {
     let all_sse = format!("{}{}", events.join(""), end_events.join(""));
     assert!(all_sse.contains("\"type\":\"tool_use\""));
     assert!(all_sse.contains("\"stop_reason\":\"tool_use\""));
-    assert_eq!(
-        SIGNATURE_STORE.get(None).as_deref(),
-        Some("stream_sig_999")
-    );
+    assert_eq!(SIGNATURE_STORE.get(None).as_deref(), Some("stream_sig_999"));
 }
 
 #[test]
@@ -841,7 +842,10 @@ async fn test_e2e_mock_vertex_upstream_function_and_skill_calling() {
     }))
     .unwrap();
 
-    match server.handle_request("POST", "/v1/messages", &req_body).await {
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
         RouterResponse::Json(code, data) => {
             std::env::remove_var("GEMINI_UPSTREAM_URL");
             assert_eq!(code, 200);
@@ -927,12 +931,7 @@ fn test_auto_mode_classifier_safeguard_results_unary_and_streaming() {
                     if val["type"] == "content_block_start"
                         && val["content_block"]["type"] == "tool_use"
                     {
-                        streamed_ids.push(
-                            val["content_block"]["id"]
-                                .as_str()
-                                .unwrap()
-                                .to_string(),
-                        );
+                        streamed_ids.push(val["content_block"]["id"].as_str().unwrap().to_string());
                     } else if val["type"] == "message_delta" {
                         message_delta_json = Some(val);
                     }
@@ -1079,7 +1078,10 @@ async fn test_401_auto_token_refresh_and_adc_file_mtime_invalidation() {
     }))
     .unwrap();
 
-    match server.handle_request("POST", "/v1/messages", &req_body).await {
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
         RouterResponse::Json(code, data) => {
             assert_eq!(code, 200);
             assert_eq!(
@@ -1180,6 +1182,7 @@ async fn test_ctl_and_api_action_endpoints_e2e() {
     assert_eq!(claude_json["model"], "gemini-4-argon");
     assert_eq!(claude_json["effortLevel"], "high");
     assert_eq!(claude_json["env"]["ANTHROPIC_MODEL"], "gemini-4-argon");
+    assert!(claude_json["env"].get("DISABLE_PROMPT_CACHING").is_none());
     assert!(claude_raw.contains("ANTHROPIC_BASE_URL"));
 
     let codex_raw = std::fs::read_to_string(&codex_path).unwrap();
@@ -1205,10 +1208,7 @@ async fn test_ctl_and_api_action_endpoints_e2e() {
     let claude_flipped: Value =
         serde_json::from_str(&std::fs::read_to_string(&claude_path).unwrap()).unwrap();
     assert_eq!(claude_flipped["model"], "gemini-3.8-flash");
-    assert_eq!(
-        claude_flipped["env"]["ANTHROPIC_MODEL"],
-        "gemini-3.8-flash"
-    );
+    assert_eq!(claude_flipped["env"]["ANTHROPIC_MODEL"], "gemini-3.8-flash");
 
     // 4. POST /api/action -> disable both
     let disable_body = serde_json::to_vec(&json!({
@@ -1294,7 +1294,8 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
         }
     });
 
-    let tmp_adc = std::env::temp_dir().join(format!("mock_adc_hotswap_{}.json", std::process::id()));
+    let tmp_adc =
+        std::env::temp_dir().join(format!("mock_adc_hotswap_{}.json", std::process::id()));
     std::fs::write(
         &tmp_adc,
         json!({
@@ -1383,7 +1384,9 @@ async fn test_e2e_gui_claude_and_codex_live_model_and_effort_hot_swap() {
         "messages": [{"role": "user", "content": "Generate short title"}]
     }))
     .unwrap();
-    server.handle_request("POST", "/v1/messages", &haiku_req).await;
+    server
+        .handle_request("POST", "/v1/messages", &haiku_req)
+        .await;
     {
         let logs = recorded_requests.lock().unwrap();
         let last_req = logs.last().unwrap();
@@ -1550,4 +1553,420 @@ async fn test_dynamic_models_aliases_and_runtime_config() {
     }
 }
 
+#[test]
+fn test_claude_and_codex_prompt_caching_usage_and_prefix_stability() {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SIGNATURE_STORE.clear();
+    TOOL_SCHEMA_STORE.clear();
+    RESPONSE_CACHE_STORE.clear();
 
+    // 1. Claude unary + streaming prompt cache token accounting:
+    // Vertex `promptTokenCount` (1000) includes `cachedContentTokenCount` (800).
+    // Anthropic `input_tokens` must be uncached (200) and `cache_read_input_tokens` = 800.
+    let gemini_cached_resp = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{"text": "Cached reply"}]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 1000,
+            "candidatesTokenCount": 50,
+            "cachedContentTokenCount": 800,
+            "thoughtsTokenCount": 30
+        }
+    });
+
+    let claude_unary = gemini_to_anthropic_response(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(claude_unary["usage"]["input_tokens"], 200);
+    assert_eq!(claude_unary["usage"]["cache_read_input_tokens"], 800);
+    assert_eq!(claude_unary["usage"]["cache_creation_input_tokens"], 0);
+    assert_eq!(claude_unary["usage"]["output_tokens"], 50);
+
+    let mut stream_state = AnthropicStreamState::new("gemini-4-argon");
+    let mut sse_events = stream_state.process_gemini_chunk(&gemini_cached_resp);
+    sse_events.extend(stream_state.finish());
+    let joined_sse = sse_events.join("");
+    assert!(joined_sse.contains("\"cache_read_input_tokens\":800"));
+    assert!(joined_sse.contains("\"input_tokens\":200"));
+    assert_eq!(stream_state.cached_tokens, 800);
+    assert_eq!(stream_state.reasoning_tokens, 30);
+
+    // 2. OpenAI Codex (/v1/responses and /v1/chat/completions) cached & reasoning token details
+    let codex_unary = gemini_to_openai_responses(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(codex_unary["usage"]["input_tokens"], 1000);
+    assert_eq!(
+        codex_unary["usage"]["input_tokens_details"]["cached_tokens"],
+        800
+    );
+    assert_eq!(
+        codex_unary["usage"]["input_tokens_details"]["cache_write_tokens"],
+        0
+    );
+    assert_eq!(codex_unary["usage"]["output_tokens"], 50);
+    assert_eq!(
+        codex_unary["usage"]["output_tokens_details"]["reasoning_tokens"],
+        30
+    );
+
+    let chat_unary = gemini_to_openai_chat_response(&gemini_cached_resp, "gemini-4-argon");
+    assert_eq!(
+        chat_unary["usage"]["prompt_tokens_details"]["cached_tokens"],
+        800
+    );
+    assert_eq!(
+        chat_unary["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        30
+    );
+
+    // 3. Codex prefix stability: mid-conversation `developer` messages must NOT mutate root `systemInstruction`
+    let codex_turn1 = json!({
+        "model": "gemini-4-argon",
+        "instructions": "Base system prompt",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Permissions: workspace-write"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1 user question"}]}
+        ]
+    });
+    let (_m1, gem_t1) = openai_responses_to_gemini_request(&codex_turn1);
+
+    let codex_turn2 = json!({
+        "model": "gemini-4-argon",
+        "instructions": "Base system prompt",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Permissions: workspace-write"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1 user question"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Turn 1 answer"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Mid-turn environment update"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 2 user question"}]}
+        ]
+    });
+    let (_m2, gem_t2) = openai_responses_to_gemini_request(&codex_turn2);
+
+    // `systemInstruction` must be 100% identical between Turn 1 and Turn 2 so Vertex AI hits the prefix cache!
+    assert_eq!(gem_t1["systemInstruction"], gem_t2["systemInstruction"]);
+    assert_eq!(gem_t1["contents"][0], gem_t2["contents"][0]);
+
+    // 4. `previous_response_id` stateful prefix reconstruction via RESPONSE_CACHE_STORE
+    record_response_cache_state(
+        "resp_turn1_cached",
+        Some("codex_session_key_1"),
+        &gem_t1,
+        &[json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Turn 1 answer"}]
+        })],
+    );
+
+    let codex_incremental_turn2 = json!({
+        "model": "gemini-4-argon",
+        "previous_response_id": "resp_turn1_cached",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Incremental turn 2"}]}
+        ]
+    });
+    let (_m_inc, gem_inc) = openai_responses_to_gemini_request(&codex_incremental_turn2);
+    assert_eq!(gem_inc["systemInstruction"], gem_t1["systemInstruction"]);
+    let inc_contents = gem_inc["contents"].as_array().unwrap();
+    assert_eq!(inc_contents.len(), 3);
+    assert_eq!(inc_contents[0]["parts"][0]["text"], "Turn 1 user question");
+    assert_eq!(inc_contents[1]["parts"][0]["text"], "Turn 1 answer");
+    assert_eq!(inc_contents[2]["parts"][0]["text"], "Incremental turn 2");
+}
+
+#[tokio::test]
+async fn test_no_unconfigured_fallback_to_3_8_and_transient_retry_on_same_model() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _async_guard = ASYNC_ENV_LOCK.lock().await;
+    std::env::remove_var("GEMINI_FALLBACK_MODEL");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let recorded_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let call_count_clone = call_count.clone();
+    let recorded_urls_clone = recorded_urls.clone();
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16384];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first_line = req_str.lines().next().unwrap_or("").to_string();
+                recorded_urls_clone.lock().unwrap().push(first_line);
+
+                let idx = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if idx == 0 {
+                    // Simulate transient post-wake 503 error on first attempt
+                    let err_body =
+                        r#"{"error":{"code":503,"message":"Service temporarily unavailable"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        err_body.len(),
+                        err_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    let ok_body = json!({
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": "Recovered on Argon"}]},
+                            "finishReason": "STOP"
+                        }],
+                        "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 6}
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        ok_body.len(),
+                        ok_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        }
+    });
+
+    std::env::set_var("GEMINI_UPSTREAM_URL", format!("http://{}", mock_addr));
+    let server = RouterServer::new(Some("test-proj".to_string()), Some("global".to_string()));
+
+    // Configure primary_model = gemini-4-argon with fallback_model = null
+    let cfg = serde_json::to_vec(&json!({
+        "primary_model": "gemini-4-argon",
+        "fallback_model": Value::Null,
+        "reasoning_effort": "high",
+        "hot_swap": true
+    }))
+    .unwrap();
+    match server.handle_request("POST", "/config", &cfg).await {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["primary_model"], "gemini-4-argon");
+            assert_eq!(data["active_model"], "gemini-4-argon");
+            assert!(data["fallback_model"].is_null());
+        }
+        _ => panic!("Expected 200 JSON from POST /config"),
+    }
+
+    // 1. Send request: first upstream call returns 503, router must retry on gemini-4-argon (NOT downgrade to gemini-3.8-flash!)
+    let req_body = serde_json::to_vec(&json!({
+        "model": "gemini-4-argon",
+        "messages": [{"role": "user", "content": "Test post-idle resilience"}]
+    }))
+    .unwrap();
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["content"][0]["text"], "Recovered on Argon");
+        }
+        _ => panic!("Expected 200 JSON from POST /v1/messages"),
+    }
+
+    // Both attempts must have targeted gemini-4-argon, never gemini-3.8-flash
+    {
+        let urls = recorded_urls.lock().unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("models/gemini-4-argon:generateContent"));
+        assert!(urls[1].contains("models/gemini-4-argon:generateContent"));
+    }
+
+    // 2. Send a background fast-tier (claude-haiku-4-5) request; verify it does NOT clobber active_model from gemini-4-argon to gemini-3.8-flash
+    let haiku_body = serde_json::to_vec(&json!({
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "Background title task"}]
+    }))
+    .unwrap();
+    let _ = server
+        .handle_request("POST", "/v1/messages", &haiku_body)
+        .await;
+
+    match server.handle_request("GET", "/health", b"").await {
+        RouterResponse::Json(code, data) => {
+            assert_eq!(code, 200);
+            assert_eq!(data["primary_model"], "gemini-4-argon");
+            assert_eq!(data["default_model"], "gemini-4-argon");
+            assert_eq!(data["metrics"]["active_model"], "gemini-4-argon");
+            assert!(data["fallback_model"].is_null());
+            assert_eq!(data["stats"]["fallback_count"], 0);
+        }
+        _ => panic!("Expected 200 JSON from GET /health"),
+    }
+
+    std::env::remove_var("GEMINI_UPSTREAM_URL");
+}
+
+#[tokio::test]
+async fn test_streaming_multibyte_utf8_chunk_split_and_lru_signature_retention() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _async_guard = ASYNC_ENV_LOCK.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+
+            let sse_line = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Launch 🚀 complete\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n";
+            let bytes = sse_line.as_bytes();
+            // Find the 4-byte UTF-8 sequence for 🚀 (0xF0 0x9F 0x9A 0x80) and split right in the middle of it!
+            let rocket_pos = bytes
+                .windows(4)
+                .position(|w| w == [0xF0, 0x9F, 0x9A, 0x80])
+                .unwrap();
+            let split_at = rocket_pos + 2;
+
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(header.as_bytes()).await;
+
+            let part1 = &bytes[..split_at];
+            let chunk1 = format!("{:x}\r\n", part1.len());
+            let _ = sock.write_all(chunk1.as_bytes()).await;
+            let _ = sock.write_all(part1).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let part2 = &bytes[split_at..];
+            let chunk2 = format!("{:x}\r\n", part2.len());
+            let _ = sock.write_all(chunk2.as_bytes()).await;
+            let _ = sock.write_all(part2).await;
+            let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
+            let _ = sock.flush().await;
+        }
+    });
+
+    std::env::set_var("GEMINI_UPSTREAM_URL", format!("http://{}", mock_addr));
+    let server = RouterServer::new(Some("test-proj".to_string()), Some("global".to_string()));
+    let req_body = serde_json::to_vec(&json!({
+        "model": "gemini-4-argon",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Stream multibyte emoji"}]
+    }))
+    .unwrap();
+
+    match server
+        .handle_request("POST", "/v1/messages", &req_body)
+        .await
+    {
+        RouterResponse::Sse(mut rx) => {
+            let mut collected = String::new();
+            while let Some(ev) = rx.recv().await {
+                collected.push_str(&ev);
+            }
+            std::env::remove_var("GEMINI_UPSTREAM_URL");
+            assert!(
+                collected.contains("Launch 🚀 complete"),
+                "Expected intact UTF-8 emoji across split chunks, got: {}",
+                collected
+            );
+            assert!(!collected.contains('\u{FFFD}'));
+        }
+        _ => {
+            std::env::remove_var("GEMINI_UPSTREAM_URL");
+            panic!("Expected SSE response");
+        }
+    }
+}
+
+#[test]
+fn test_claude_prompt_cache_continuity_across_replica_misses_and_sse_start() {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    PROMPT_CACHE_STORE.clear();
+
+    let claude_turn1_req = json!({
+        "model": "gemini-4-argon",
+        "system": [
+            {
+                "type": "text",
+                "text": "You are Claude Code, a large system prompt prefix...",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "Turn 1 question"}
+        ]
+    });
+    let (_m1, gem_payload1) = anthropic_to_gemini_request(&claude_turn1_req);
+    let hint1 = extract_anthropic_cache_hint(&claude_turn1_req, &gem_payload1);
+
+    // Turn 1: Vertex AI hits implicit cache with 124,627 cached tokens out of 140,000 prompt tokens
+    let gem_resp1 = json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "Turn 1 answer"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 140000,
+            "candidatesTokenCount": 300,
+            "cachedContentTokenCount": 124627
+        }
+    });
+    let resp1 = gemini_to_anthropic_response_with_hint(&gem_resp1, "gemini-4-argon", Some(&hint1));
+    assert_eq!(resp1["usage"]["cache_read_input_tokens"], 124627);
+    assert_eq!(resp1["usage"]["input_tokens"], 140000 - 124627);
+
+    // Turn 2: Vertex AI lands on a cold replica that reports `cachedContentTokenCount: 0` (or omits it)
+    // and streams Chunk 1 without `usageMetadata` followed by Chunk 2 with `promptTokenCount: 142450, cachedContentTokenCount: 0`.
+    let claude_turn2_req = json!({
+        "model": "gemini-4-argon",
+        "system": [
+            {
+                "type": "text",
+                "text": "You are Claude Code, a large system prompt prefix...",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "Turn 1 question"},
+            {"role": "assistant", "content": "Turn 1 answer"},
+            {"role": "user", "content": "Turn 2 follow-up"}
+        ]
+    });
+    let (_m2, gem_payload2) = anthropic_to_gemini_request(&claude_turn2_req);
+    let hint2 = extract_anthropic_cache_hint(&claude_turn2_req, &gem_payload2);
+
+    let mut stream_state = AnthropicStreamState::with_cache_hint("gemini-4-argon", hint2.clone());
+    // Chunk 1 has no usageMetadata yet -> `message_start` must STILL preserve `cache_read_input_tokens: 124627`!
+    let chunk1 = json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "Streaming "}]}, "finishReason": "STOP"}]
+    });
+    let ev1 = stream_state.process_gemini_chunk(&chunk1).join("");
+    assert!(
+        ev1.contains("\"cache_read_input_tokens\":124627"),
+        "Expected message_start to preserve cache_read_input_tokens=124627, got: {}",
+        ev1
+    );
+
+    // Chunk 2 has promptTokenCount=142450 and cachedContentTokenCount=0 (cold replica miss)
+    let chunk2 = json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "complete"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 142450,
+            "candidatesTokenCount": 417,
+            "cachedContentTokenCount": 0
+        }
+    });
+    let _ = stream_state.process_gemini_chunk(&chunk2);
+    let ev_finish = stream_state.finish().join("");
+    assert!(
+        ev_finish.contains("\"cache_read_input_tokens\":124627"),
+        "Expected message_delta to preserve cache_read_input_tokens=124627, got: {}",
+        ev_finish
+    );
+    assert!(
+        ev_finish.contains("\"input_tokens\":17823"),
+        "Expected uncached input_tokens=17823 (142450 - 124627), got: {}",
+        ev_finish
+    );
+}

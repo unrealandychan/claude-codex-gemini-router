@@ -4,9 +4,28 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROUTER_ENV_FILE="${HOME}/.config/omarchy/gemini-router/router.env"
+if [[ ! -f "${ROUTER_ENV_FILE}" && -f "${HOME}/.config/gemini-router/router.env" ]]; then
+  ROUTER_ENV_FILE="${HOME}/.config/gemini-router/router.env"
+fi
+
+read_env_key() {
+  local key="$1"
+  local file="$2"
+  if [[ -f "$file" && ! -L "$file" ]]; then
+    awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit }' "$file"
+  fi
+}
+
+if [[ -z "${ROUTER_PORT:-}" ]]; then
+  ROUTER_PORT="$(read_env_key "ROUTER_PORT" "${ROUTER_ENV_FILE}")"
+fi
 ROUTER_PORT="${ROUTER_PORT:-4000}"
 ROUTER_URL="http://127.0.0.1:${ROUTER_PORT}"
 
+if [[ -z "${GEMINI_PRIMARY_MODEL:-}" ]]; then
+  GEMINI_PRIMARY_MODEL="$(read_env_key "GEMINI_PRIMARY_MODEL" "${ROUTER_ENV_FILE}")"
+fi
 PRIMARY_MODEL="${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}"
 PRINT_ENV_ONLY=false
 START_ONLY=false
@@ -20,6 +39,14 @@ while [[ $# -gt 0 ]]; do
     --4.0|--argon|--pro)
       PRIMARY_MODEL="gemini-4-argon"
       shift
+      ;;
+    --model)
+      if [[ $# -ge 2 ]]; then
+        PRIMARY_MODEL="$2"
+        shift 2
+      else
+        shift
+      fi
       ;;
     --model=*)
       PRIMARY_MODEL="${1#*=}"
@@ -41,7 +68,7 @@ done
 
 if [[ "${PRINT_ENV_ONLY}" == "true" ]]; then
   cat <<EOF
-unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_USE_VERTEX
+unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_USE_VERTEX DISABLE_PROMPT_CACHING DISABLE_PROMPT_CACHING_HAIKU DISABLE_PROMPT_CACHING_SONNET DISABLE_PROMPT_CACHING_OPUS
 export ANTHROPIC_BASE_URL="${ROUTER_URL}"
 export ANTHROPIC_AUTH_TOKEN="adc-keyless"
 export ANTHROPIC_MODEL="${PRIMARY_MODEL}"
@@ -49,7 +76,6 @@ export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${PRIMARY_MODEL}"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="${PRIMARY_MODEL}"
-export DISABLE_PROMPT_CACHING=1
 EOF
   exit 0
 fi
@@ -69,6 +95,19 @@ resolve_router_bin() {
   fi
 }
 
+resolve_ctl_bin() {
+  if [[ -x "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl" ]]; then
+    echo "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl"
+  elif command -v omarchy-gemini-router-ctl >/dev/null 2>&1; then
+    command -v omarchy-gemini-router-ctl
+  elif [[ -x "${HOME}/.local/bin/omarchy-gemini-router-ctl" ]]; then
+    echo "${HOME}/.local/bin/omarchy-gemini-router-ctl"
+  else
+    (cd "${PROJECT_DIR}" && cargo build --release --locked >&2)
+    echo "${PROJECT_DIR}/target/release/omarchy-gemini-router-ctl"
+  fi
+}
+
 if [[ "${START_ONLY}" == "true" ]]; then
   ROUTER_BIN="$(resolve_router_bin)"
   exec "${ROUTER_BIN}" --port "${ROUTER_PORT}" "$@"
@@ -77,6 +116,10 @@ fi
 # Ensure router is running in the background
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
 export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
+if [[ -x "$(resolve_ctl_bin 2>/dev/null || true)" ]]; then
+  CTL_BIN="$(resolve_ctl_bin)"
+  "${CTL_BIN}" start-router >/dev/null 2>&1 || true
+fi
 if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
   echo "[claude-gemini] Starting Rust ADC router on ${ROUTER_URL}..." >&2
   ROUTER_BIN="$(resolve_router_bin)"
@@ -93,7 +136,7 @@ if ! curl --noproxy '*' -fsS "${ROUTER_URL}/health" >/dev/null 2>&1; then
   done
 fi
 
-unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+unset ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY DISABLE_PROMPT_CACHING DISABLE_PROMPT_CACHING_HAIKU DISABLE_PROMPT_CACHING_SONNET DISABLE_PROMPT_CACHING_OPUS
 export CLAUDE_CODE_USE_VERTEX=0
 export ANTHROPIC_BASE_URL="${ROUTER_URL}"
 export ANTHROPIC_AUTH_TOKEN="adc-keyless"
@@ -102,9 +145,8 @@ export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${PRIMARY_MODEL}[1m]"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="${PRIMARY_MODEL}[1m]"
-export DISABLE_PROMPT_CACHING=1
 
-SETTINGS_OVERRIDE="{\"env\":{\"CLAUDE_CODE_USE_VERTEX\":\"0\",\"ANTHROPIC_BASE_URL\":\"${ROUTER_URL}\",\"ANTHROPIC_AUTH_TOKEN\":\"adc-keyless\",\"ANTHROPIC_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"DISABLE_PROMPT_CACHING\":\"1\"}}"
+SETTINGS_OVERRIDE="{\"env\":{\"CLAUDE_CODE_USE_VERTEX\":\"0\",\"ANTHROPIC_BASE_URL\":\"${ROUTER_URL}\",\"ANTHROPIC_AUTH_TOKEN\":\"adc-keyless\",\"ANTHROPIC_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_SMALL_FAST_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"claude-haiku-4-5\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"${PRIMARY_MODEL}[1m]\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"${PRIMARY_MODEL}[1m]\"}}"
 
 if command -v claude >/dev/null 2>&1; then
   exec claude --settings "${SETTINGS_OVERRIDE}" "$@"
